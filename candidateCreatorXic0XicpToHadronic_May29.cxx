@@ -1,0 +1,2496 @@
+// Copyright 2019-2020 CERN and copyright holders of ALICE O2.
+// See https://alice-o2.web.cern.ch/copyright for details of the copyright holders.
+// All rights not expressly granted are reserved.
+//
+// This software is distributed under the terms of the GNU General Public
+// License v3 (GPL Version 3), copied verbatim in the file "COPYING".
+//
+// In applying this license CERN does not waive the privileges and immunities
+// granted to it by virtue of its status as an Intergovernmental Organization
+// or submit itself to any jurisdiction.
+
+/// \file candidateCreatorXicToXiPiPi.cxx
+//---------------------------------------
+/// \brief Reconstruction of Ξc± → (Ξ∓ → (Λ → p π∓) π∓) π± π± candidates
+/// \author Phil Lennart Stahlhut <phil.lennart.stahlhut@cern.ch>, Heidelberg University
+/// \author Carolina Reetz <c.reetz@cern.ch>, Heidelberg University
+/// \author Jaeyoon Cho <jaeyoon.cho@cern.ch>, Inha University
+/// \author Jinjoo Seo <jseo@cern.ch>, Heidelberg University
+
+/// \file candidateCreatorXic0Omegac0.cxx
+//---------------------------------------
+/// \brief Reconstruction of Omegac0 and Xic0 decays candidates
+/// \author Federica Zanone <federica.zanone@cern.ch>, Heidelberg University
+/// \author Ruiqi Yin <ruiqi.yin@cern.ch>, Fudan University
+/// \author Yunfan Liu <yunfan.liu@cern.ch>, China University of Geosciences
+/// \author Ran Tu <ran.tu@cern.ch>, Fudan University
+
+/// \file candidateCreatorXic0XicpToHadronic.cxx
+//---------------------------------------
+/// \brief Reconstruction of Xicp and Xic0 candidates 
+/// \author Jinhyun Park <jinhyun.park@cern.ch>, Pusan National University
+/// \author Krista Smith <krista.lizbeth.smith@cern.ch>, Pusan National University
+
+#ifndef HomogeneousField
+#define HomogeneousField // o2-linter: disable=name/macro (required by KFParticle)
+#endif
+
+#ifndef HomogeneousField
+#define HomogeneousField // o2-linter: disable=name/macro (required by KFParticle)
+#endif
+
+#include <string>
+#include <utility>
+#include <vector>
+#include <algorithm>
+
+#include <KFParticleBase.h>
+#include <KFParticle.h>
+#include <KFPTrack.h>
+#include <KFPVertex.h>
+#include <KFVertex.h>
+
+#include <TPDGCode.h>
+
+#include "CommonConstants/PhysicsConstants.h"
+#include "DCAFitter/DCAFitterN.h"
+#include "Framework/AnalysisTask.h"
+#include "Framework/HistogramRegistry.h"
+#include "Framework/runDataProcessing.h"
+#include "ReconstructionDataFormats/DCA.h"
+#include "Framework/RunningWorkflowInfo.h"
+
+#include "Common/Core/trackUtilities.h"
+#include "Common/DataModel/CollisionAssociationTables.h"
+#include "Tools/KFparticle/KFUtilities.h"
+
+#include "PWGLF/DataModel/LFStrangenessTables.h"
+
+#include "PWGHF/DataModel/CandidateReconstructionTables.h"
+#include "PWGHF/Utils/utilsBfieldCCDB.h"
+#include "PWGHF/Utils/utilsEvSelHf.h"
+
+using namespace o2;
+using namespace o2::analysis;
+using namespace o2::constants::physics;
+using namespace o2::framework;
+using namespace o2::hf_evsel;
+using namespace o2::hf_centrality;
+using namespace o2::hf_occupancy;
+////////
+
+/// Reconstruction of heavy-flavour 2 and 3-prong decay candidates
+struct HfCandidateCreatorXic0XicpToHadronic {
+  Produces<aod::HfCandXicBase> rowCandidateBase;  // Xicp or Xic0 DCAFitter 
+  Produces<aod::HfCandXicKF> rowCandidateKF; // Xicp or Xic0 KFParticle 
+ 
+  Configurable<bool> fillHistograms{"fillHistograms", true, "do validation plots"};
+  // magnetic field setting from CCDB
+  Configurable<bool> isRun2{"isRun2", false, "enable Run 2 or Run 3 GRP objects for magnetic field"};
+
+  Configurable<bool> runXic0{"runXic0", false, "analyze Xic0 Run 3 data"};  // select decay channel on each Wagon
+   Configurable<bool> runXicp{"runXicp", true, "analyze Xicp Run 3 data"};
+  
+ Configurable<std::string> ccdbUrl{"ccdbUrl", "http://alice-ccdb.cern.ch", "url of the ccdb repository"};
+  Configurable<std::string> ccdbPathLut{"ccdbPathLut", "GLO/Param/MatLUT", "Path for LUT parametrization"};
+  Configurable<std::string> ccdbPathGrp{"ccdbPathGrp", "GLO/GRP/GRP", "Path of the grp file (Run 2)"};
+  Configurable<std::string> ccdbPathGrpMag{"ccdbPathGrpMag", "GLO/Config/GRPMagField", "CCDB path of the GRPMagField object (Run 3)"};
+   Configurable<bool> doCascadePreselection{"doCascadePreselection", true, "Use invariant mass and dcaXY cuts to preselect cascade candidates"};
+  Configurable<double> massToleranceCascade{"massToleranceCascade", 0.01, "Invariant mass tolerance for cascade"};
+  Configurable<float> dcaXYToPVCascadeMax{"dcaXYToPVCascadeMax", 3, "Max cascade DCA to PV in xy plane"};
+  // DCA fitter
+  Configurable<bool> propagateToPCA{"propagateToPCA", true, "create tracks version propagated to PCA"};
+  Configurable<double> maxR{"maxR", 200., "reject PCA's above this radius"};
+  Configurable<double> maxDZIni{"maxDZIni", 4., "reject (if>0) PCA candidate if tracks DZ exceeds threshold"};
+  Configurable<double> minParamChange{"minParamChange", 1.e-3, "stop iterations if largest change of any X is smaller than this"};
+  Configurable<double> minRelChi2Change{"minRelChi2Change", 0.9, "stop iterations is chi2/chi2old > this"};
+  Configurable<bool> useAbsDCA{"useAbsDCA", false, "Minimise abs. distance rather than chi2"};
+  Configurable<bool> useWeightedFinalPCA{"useWeightedFinalPCA", false, "Recalculate vertex position using track covariances, effective only if useAbsDCA is true"};
+  //  KFParticle
+  Configurable<bool> useXiMassConstraint{"useXiMassConstraint", true, "Use mass constraint for Xi"};
+  Configurable<bool> constrainXicPlusToPv{"constrainXicPlusToPv", false, "Constrain XicPlus to PV"};
+   Configurable<bool> constrainXicZeroToPv{"constrainXicZeroToPv", false, "Constrain XicZero to PV"};
+  Configurable<bool> constrainXiToXicPlus{"constrainXiToXicPlus", false, "Constrain Xi to XicPlus"};
+   Configurable<bool> constrainXiToXicZero{"constrainXiToXicZero", false, "Constrain Xi to XicZero"};
+  Configurable<int> kfConstructMethod{"kfConstructMethod", 2, "Construct method of XicPlus: 0 fast mathematics without constraint of fixed daughter particle masses, 2 daughter particle masses stay fixed in construction process"};
+  Configurable<bool> rejDiffCollTrack{"rejDiffCollTrack", true, "Reject tracks coming from different collisions (effective only for KFParticle w/o derived data)"};
+  
+  o2::vertexing::DCAFitterN<3> df;
+  o2::vertexing::DCAFitterN<2> df2;  // NEW
+  Service<o2::ccdb::BasicCCDBManager> ccdb;
+  o2::base::MatLayerCylSet* lut;
+  o2::base::Propagator::MatCorrType noMatCorr = o2::base::Propagator::MatCorrType::USEMatCorrNONE;
+ 
+
+  // new below
+  enum XicCandCounter { TotalSkimmedTriplets = 0,
+                        SelEvent,
+                        CascPreSel,
+                        VertexFit };
+  // new above
+  
+  using CascadesLinked = soa::Join<aod::Cascades, aod::CascDataLink>; // same
+  using CascFull = soa::Join<aod::CascDatas, aod::CascCovs>; // same
+  using KFCascadesLinked = soa::Join<aod::Cascades, aod::KFCascDataLink>; // same
+  using KFCascFull = soa::Join<aod::KFCascDatas, aod::KFCascCovs>; // same
+  using TracksWCovDcaPidPrPi = soa::Join<aod::TracksWCovDca, aod::TracksPidPr, aod::TracksPidPi>; // same but commented out
+  using TracksWCovExtraPidPrPi = soa::Join<aod::TracksWCovExtra, aod::TracksPidPr, aod::TracksPidPi>; // same but commented out
+  //using TracksWCovDcaExtraPidPrPi = soa::Join<aod::TracksWCovDcaExtra, aod::TracksPidPr, aod::TracksPidPi>;  // NEW
+  
+  HistogramRegistry registry{"registry"};
+
+  int runNumber{0};
+  float massXiPiPi{0.};
+  float massXiPi0{0.};
+  float massXiPi1{0.};
+  float massXiPi{0.}; // NEW
+  double bz{0.};
+
+  // HfEventSelection hfEvSel;
+  
+   ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+ // Init
+  void init(InitContext const&)
+  {
+    
+    ///////////////// NEW:  12 processes (6 for Xicp and 6 for Xic0)
+    // process DCAFitter with a) Xicp b.) centrality or no centrality
+    std::array<bool, 3> doprocessDF{doprocessWithDCAFitterN,
+    	doprocessWithDCAFitterNCentFT0C,
+    	doprocessWithDCAFitterNCentFT0M};
+    
+    // process KFParticle with a) Xicp b) PV or not PVRefit c) centrality or no centrality
+    std::array<bool, 3> doprocessKF{doprocessWithKFParticle,
+    	doprocessWithKFParticleCentFT0C,
+    	doprocessWithKFParticleCentFT0M};
+    
+    // process DCAFitter with a) Xic0 b) centrality or no centrality
+    std::array<bool, 3> doprocessDFXic0{doprocessWithDCAFitterNXic0,
+    	doprocessWithDCAFitterNCentFT0CXic0,
+    	doprocessWithDCAFitterNCentFT0MXic0};
+    
+    //  // process KFParticle with a) Xic0 b) centrality or no centrality
+    std::array<bool, 3> doprocessKFXic0{doprocessWithKFParticleXic0,
+    	doprocessWithKFParticleCentFT0CXic0,
+    	doprocessWithKFParticleCentFT0MXic0};
+    // ///////////////// NEW
+
+    if ( (std::accumulate(doprocessDF.begin(), doprocessDF.end(), 0) + std::accumulate(doprocessKF.begin(), doprocessKF.end(), 0) + std::accumulate(doprocessDFXic0.begin(), doprocessDFXic0.end(), 0) + std::accumulate(doprocessKFXic0.begin(), doprocessKFXic0.end(), 0) ) != 1)
+      {
+    	LOGP(fatal, "One and only one process function must be enabled at a time.");
+      }
+
+    std::array<bool, 3> processesCollisions = {doprocessCollisions, doprocessCollisionsCentFT0C, doprocessCollisionsCentFT0M};
+    const int nProcessesCollisions = std::accumulate(processesCollisions.begin(), processesCollisions.end(), 0);
+    if (nProcessesCollisions > 1)
+      {
+    	LOGP(fatal, "At most one process function for collision monitoring can be enabled at a time.");
+      }
+    if (nProcessesCollisions == 1)
+      {
+    	if ( ( doprocessWithDCAFitterN || doprocessWithKFParticle || doprocessWithDCAFitterNXic0 || doprocessWithKFParticleXic0 ) && !doprocessCollisions)
+    	  {
+    	    LOGP(fatal, "Process function for collision monitoring not correctly enabled. Did you enable \"processCollisions\"?");
+    	  }
+    	if ((doprocessWithDCAFitterNCentFT0C || doprocessWithKFParticleCentFT0C || doprocessWithDCAFitterNCentFT0CXic0 || doprocessWithKFParticleCentFT0CXic0) && !doprocessCollisionsCentFT0C)
+    	  {
+    	    LOGP(fatal, "Process function for collision monitoring not correctly enabled. Did you enable \"processCollisionsCentFT0C\"?");
+    	  }
+    	if ((doprocessWithDCAFitterNCentFT0M || doprocessWithKFParticleCentFT0M || doprocessWithDCAFitterNCentFT0MXic0 || doprocessWithKFParticleCentFT0MXic0 ) && !doprocessCollisionsCentFT0M)
+    	  {
+    	    LOGP(fatal, "Process function for collision monitoring not correctly enabled. Did you enable \"processCollisionsCentFT0M\"?");
+    	  }
+       }
+
+    // check if running more than one Xic0 or Xicp process
+    std::array<bool, 6> processXic0 = {doprocessWithDCAFitterNXic0, doprocessWithKFParticleXic0, doprocessWithDCAFitterNCentFT0CXic0, doprocessWithKFParticleCentFT0CXic0, doprocessWithDCAFitterNCentFT0MXic0, doprocessWithKFParticleCentFT0MXic0};
+    const int nProcessXic0 = std::accumulate(processXic0.begin(), processXic0.end(), 0);
+    std::array<bool, 6> processXicp = {doprocessWithDCAFitterN, doprocessWithKFParticle, doprocessWithDCAFitterNCentFT0C, doprocessWithKFParticleCentFT0C, doprocessWithDCAFitterNCentFT0M, doprocessWithKFParticleCentFT0M};
+    const int nProcessXicp = std::accumulate(processXicp.begin(), processXicp.end(), 0);
+
+    if(nProcessXic0 > 1)
+       LOGP(fatal, "More than one process function has been enabled for Xic0 analysis - please select one Xic0 process function at a time");
+    if(nProcessXicp > 1)
+      LOGP(fatal, "More than one process function has been enabled for Xicp analysis - please select one Xicp process function at a time");
+
+    // check that only Xic0 or Xicp analysis is enabled at a time
+    if( (nProcessXic0 >= 1) && (nProcessXicp >= 1) )
+       LOGP(fatal, "Xic0 and Xicp process functions cannot both be enabled");
+
+      registry.add("hVertexerType", "Use KF or DCAFitterN;Vertexer type;entries", {HistType::kTH1F, {{2, -0.5, 1.5}}}); // See o2::aod::hf_cand::VertexerType
+      registry.add("hCandCounter", "hCandCounter", {HistType::kTH1F, {{4, -0.5, 3.5}}});
+      registry.get<TH1>(HIST("hCandCounter"))->GetXaxis()->SetBinLabel(1 + TotalSkimmedTriplets, "total");
+      registry.get<TH1>(HIST("hCandCounter"))->GetXaxis()->SetBinLabel(1 + SelEvent, "Event selected");
+      registry.get<TH1>(HIST("hCandCounter"))->GetXaxis()->SetBinLabel(1 + CascPreSel, "Cascade preselection");
+      registry.get<TH1>(HIST("hCandCounter"))->GetXaxis()->SetBinLabel(1 + VertexFit, "Successful vertex fit");
+    // physical variables
+       if(runXic0 && !runXicp)
+	{
+	  registry.add("hMass2", "2-prong candidates;inv. mass (#Xi #pi ) (GeV/#it{c}^{2});entries", {HistType::kTH1D, {{500, 2.3, 2.7}}});
+	  registry.add("hCovPVXX", "2-prong candidates;XX element of cov. matrix of prim. vtx. position (cm^{2});entries", {HistType::kTH1D, {{100, 0., 1.e-4}}});
+	  registry.add("hCovSVXX", "2-prong candidates;XX element of cov. matrix of sec. vtx. position (cm^{2});entries", {HistType::kTH1D, {{100, 0., 0.2}}});
+	  registry.add("hCovPVYY", "2-prong candidates;YY element of cov. matrix of prim. vtx. position (cm^{2});entries", {HistType::kTH1D, {{100, 0., 1.e-4}}});
+	  registry.add("hCovSVYY", "2-prong candidates;YY element of cov. matrix of sec. vtx. position (cm^{2});entries", {HistType::kTH1D, {{100, 0., 0.2}}});
+	  registry.add("hCovPVXZ", "2-prong candidates;XZ element of cov. matrix of prim. vtx. position (cm^{2});entries", {HistType::kTH1D, {{100, -1.e-4, 1.e-4}}});
+	  registry.add("hCovSVXZ", "2-prong candidates;XZ element of cov. matrix of sec. vtx. position (cm^{2});entries", {HistType::kTH1D, {{100, -1.e-4, 0.2}}});
+	  registry.add("hCovPVZZ", "2-prong candidates;ZZ element of cov. matrix of prim. vtx. position (cm^{2});entries", {HistType::kTH1D, {{100, 0., 1.e-4}}});
+	  registry.add("hCovSVZZ", "2-prong candidates;ZZ element of cov. matrix of sec. vtx. position (cm^{2});entries", {HistType::kTH1D, {{100, 0., 0.2}}});
+	  registry.add("hDcaXYProngs", "DCAxy of 2-prong candidates;#it{p}_{T} (GeV/#it{c};#it{d}_{xy}) (#mum);entries", {HistType::kTH2D, {{100, 0., 20.}, {200, -500., 500.}}});
+	  registry.add("hDcaZProngs", "DCAz of 2-prong candidates;#it{p}_{T} (GeV/#it{c};#it{d}_{z}) (#mum);entries", {HistType::kTH2D, {{100, 0., 20.}, {200, -500., 500.}}});
+	}
+       if(!runXic0 && runXicp)
+	{
+	  registry.add("hMass3", "3-prong candidates;inv. mass (#Xi #pi #pi) (GeV/#it{c}^{2});entries", {HistType::kTH1D, {{500, 2.3, 2.7}}});
+	  registry.add("hCovPVXX", "3-prong candidates;XX element of cov. matrix of prim. vtx. position (cm^{2});entries", {HistType::kTH1D, {{100, 0., 1.e-4}}});
+	  registry.add("hCovSVXX", "3-prong candidates;XX element of cov. matrix of sec. vtx. position (cm^{2});entries", {HistType::kTH1D, {{100, 0., 0.2}}});
+	  registry.add("hCovPVYY", "3-prong candidates;YY element of cov. matrix of prim. vtx. position (cm^{2});entries", {HistType::kTH1D, {{100, 0., 1.e-4}}});
+	  registry.add("hCovSVYY", "3-prong candidates;YY element of cov. matrix of sec. vtx. position (cm^{2});entries", {HistType::kTH1D, {{100, 0., 0.2}}});
+	  registry.add("hCovPVXZ", "3-prong candidates;XZ element of cov. matrix of prim. vtx. position (cm^{2});entries", {HistType::kTH1D, {{100, -1.e-4, 1.e-4}}});
+	  registry.add("hCovSVXZ", "3-prong candidates;XZ element of cov. matrix of sec. vtx. position (cm^{2});entries", {HistType::kTH1D, {{100, -1.e-4, 0.2}}});
+	  registry.add("hCovPVZZ", "3-prong candidates;ZZ element of cov. matrix of prim. vtx. position (cm^{2});entries", {HistType::kTH1D, {{100, 0., 1.e-4}}});
+	  registry.add("hCovSVZZ", "3-prong candidates;ZZ element of cov. matrix of sec. vtx. position (cm^{2});entries", {HistType::kTH1D, {{100, 0., 0.2}}});
+	  registry.add("hDcaXYProngs", "DCAxy of 3-prong candidates;#it{p}_{T} (GeV/#it{c};#it{d}_{xy}) (#mum);entries", {HistType::kTH2D, {{100, 0., 20.}, {200, -500., 500.}}});
+	  registry.add("hDcaZProngs", "DCAz of 3-prong candidates;#it{p}_{T} (GeV/#it{c};#it{d}_{z}) (#mum);entries", {HistType::kTH2D, {{100, 0., 20.}, {200, -500., 500.}}});
+	}
+	
+    registry.add("hVertexerType", "Use KF or DCAFitterN;Vertexer type;entries", {HistType::kTH1F, {{2, -0.5, 1.5}}}); // See o2::aod::hf_cand::VertexerType
+     
+
+      ccdb->setURL(ccdbUrl);
+      ccdb->setCaching(true);
+      ccdb->setLocalObjectValidityChecking();
+      lut = o2::base::MatLayerCylSet::rectifyPtrFromFile(ccdb->get<o2::base::MatLayerCylSet>(ccdbPathLut));
+      runNumber = 0;
+
+      //  hfEvSel.init(registry);
+       
+      // Configure DCAFitterN <3> for 3-prong Xicp
+    df.setPropagateToPCA(propagateToPCA);
+    df.setMaxR(maxR);
+    df.setMaxDZIni(maxDZIni);
+    df.setMinParamChange(minParamChange);
+    df.setMinRelChi2Change(minRelChi2Change);
+    df.setUseAbsDCA(useAbsDCA);
+    df.setWeightedFinalPCA(useWeightedFinalPCA);
+
+    // Configure DCAFitterN <2> for 2-prong Xic0 (same settings as Xicp)
+     df2.setPropagateToPCA(propagateToPCA);
+    df2.setMaxR(maxR);
+    df2.setMaxDZIni(maxDZIni);
+    df2.setMinParamChange(minParamChange);
+    df2.setMinRelChi2Change(minRelChi2Change);
+    df2.setUseAbsDCA(useAbsDCA);
+    df2.setWeightedFinalPCA(useWeightedFinalPCA);
+    
+      /// candidate monitoring
+    // setLabelHistoCands(hCandidates);
+      
+  } // end Init 
+
+
+
+  //=========
+  // RUN
+   //=========
+  template <o2::hf_centrality::CentralityEstimator centEstimator,  typename Collision>
+ ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+  // Run DCAFitter with 3Prong tracks
+  void runCreatorWithDCAFitterN(Collision const&,
+				aod::HfCascLf3Prongs const& rowsTrackIndexXicPlus,  // comment out constant if not used
+                                      CascadesLinked const&,
+                                      CascFull const&,
+                                      TracksWCovDcaPidPrPi const&,
+                                      aod::BCsWithTimestamps const&)
+    
+  {
+    // ...
+
+
+
+
+
+
+
+
+    
+   
+  //////////////////////////////////////////// NEW CODE BELOW, following 3-prong task
+    /// loop over triplets of track indices
+
+ for (const auto& rowTrackIndexXicPlus : rowsTrackIndexXicPlus) {
+      if (fillHistograms) {
+        registry.fill(HIST("hCandCounter"), TotalSkimmedTriplets);
+      }
+
+      // check if the event is selected
+      ///////////////////////////////////////////////////////////////////// HF Event Selections keeps giving error
+      auto collision = rowTrackIndexXicPlus.collision_as<Collision>();
+      float centrality{-1.f};
+      // const auto rejectionMask = hfEvSel.getHfCollisionRejectionMask<true, centEstimator, aod::BCsWithTimestamps>(collision, centrality, ccdb, registry);
+      // if (rejectionMask != 0) {
+      //   /// at least one event selection not satisfied --> reject the candidate
+      //   continue;
+      // }
+      // if (fillHistograms) {
+      //   registry.fill(HIST("hCandCounter"), SelEvent);
+      // }
+       ///////////////////////////////////////////////////////////////////// HF Event Selections keeps giving error
+
+ //      // Retrieve skimmed cascade and pion tracks
+       auto cascAodElement = rowTrackIndexXicPlus.cascade_as<CascadesLinked>();
+      if (!cascAodElement.has_cascData()) {
+        continue;
+      }
+      auto casc = cascAodElement.cascData_as<CascFull>();
+      auto trackCharmBachelor0 = rowTrackIndexXicPlus.prong0_as<TracksWCovDcaPidPrPi>();
+      auto trackCharmBachelor1 = rowTrackIndexXicPlus.prong1_as<TracksWCovDcaPidPrPi>();
+
+      // preselect cascade candidates
+      if (doCascadePreselection) {
+        if (std::abs(casc.dcaXYCascToPV()) > dcaXYToPVCascadeMax) {
+          continue;
+        }
+        if (std::abs(casc.mXi() - MassXiMinus) > massToleranceCascade) {
+          continue;
+        }
+      }
+      if (fillHistograms) {
+        registry.fill(HIST("hCandCounter"), CascPreSel);
+      }
+
+      //----------------------Set the magnetic field from ccdb---------------------------------------
+      /// The static instance of the propagator was already modified in the HFTrackIndexSkimCreator,
+      /// but this is not true when running on Run2 data/MC already converted into AO2Ds.
+      auto bc = collision.template bc_as<aod::BCsWithTimestamps>();
+      if (runNumber != bc.runNumber()) {
+        LOG(info) << ">>>>>>>>>>>> Current run number: " << runNumber;
+        initCCDB(bc, runNumber, ccdb, isRun2 ? ccdbPathGrp : ccdbPathGrpMag, lut, isRun2);
+        bz = o2::base::Propagator::Instance()->getNominalBz();
+        LOG(info) << ">>>>>>>>>>>> Magnetic field: " << bz;
+      }
+      df.setBz(bz);
+
+      //--------------------------info of V0 and cascades track from LF-tables---------------------------
+      std::array<float, 3> vertexV0 = {casc.xlambda(), casc.ylambda(), casc.zlambda()};
+      std::array<float, 3> pVecV0 = {casc.pxlambda(), casc.pylambda(), casc.pzlambda()};
+      std::array<float, 3> vertexCasc = {casc.x(), casc.y(), casc.z()};
+      std::array<float, 3> pVecCasc = {casc.px(), casc.py(), casc.pz()};
+      std::array<float, 21> covCasc = {0.};
+
+      //----------------create cascade track------------------------------------------------------------
+      constexpr std::size_t NElementsCovMatrix{6u};
+      constexpr std::array<int, NElementsCovMatrix> MomInd = {9, 13, 14, 18, 19, 20}; // cov matrix elements for momentum component
+      for (auto i = 0u; i < NElementsCovMatrix; i++) {
+        covCasc[i] = casc.positionCovMat()[i];
+        covCasc[MomInd[i]] = casc.momentumCovMat()[i];
+      }
+      // create cascade track
+      o2::track::TrackParCov trackCasc;
+      if (casc.sign() > 0) {
+        trackCasc = o2::track::TrackParCov(vertexCasc, pVecCasc, covCasc, 1, true);
+      } else if (casc.sign() < 0) {
+        trackCasc = o2::track::TrackParCov(vertexCasc, pVecCasc, covCasc, -1, true);
+      } else {
+        continue;
+      }
+      trackCasc.setAbsCharge(1);
+      trackCasc.setPID(o2::track::PID::XiMinus);
+
+      //----------------------------fit SV and create XicPlus track------------------
+      auto trackParCovCharmBachelor0 = getTrackParCov(trackCharmBachelor0);
+      auto trackParCovCharmBachelor1 = getTrackParCov(trackCharmBachelor1);
+
+      // reconstruct the 3-prong secondary vertex
+      try {
+        if (df.process(trackCasc, trackParCovCharmBachelor0, trackParCovCharmBachelor1) == 0) {
+          continue;
+        }
+      } catch (const std::runtime_error& error) {
+        LOG(info) << "Run time error found: " << error.what() << ". DCAFitterN cannot work, skipping the candidate.";
+        continue;
+      }
+      if (fillHistograms) {
+        registry.fill(HIST("hCandCounter"), VertexFit);
+      }
+
+      //----------------------------calculate physical properties-----------------------
+      // Charge of charm baryon
+      int signXic = casc.sign() < 0 ? +1 : -1;
+
+      // get SV properties
+      const auto& secondaryVertex = df.getPCACandidate();
+      auto chi2SV = df.getChi2AtPCACandidate();
+      auto covMatrixSV = df.calcPCACovMatrixFlat();
+
+      // get track momenta
+      trackCasc = df.getTrack(0);
+      trackParCovCharmBachelor0 = df.getTrack(1);
+      trackParCovCharmBachelor1 = df.getTrack(2);
+      std::array<float, 3> pVecXi;
+      std::array<float, 3> pVecPi0;
+      std::array<float, 3> pVecPi1;
+      trackCasc.getPxPyPzGlo(pVecXi);
+      trackParCovCharmBachelor0.getPxPyPzGlo(pVecPi0);
+      trackParCovCharmBachelor1.getPxPyPzGlo(pVecPi1);
+
+      // get invariant mass of Xic candidate
+      auto arrayMomenta = std::array{pVecXi, pVecPi0, pVecPi1};
+      massXiPiPi = RecoDecay::m(std::move(arrayMomenta), std::array{MassXiMinus, MassPiPlus, MassPiPlus});
+
+      // get track impact parameters
+      // This modifies track momenta!
+      auto primaryVertex = getPrimaryVertex(collision);
+      auto covMatrixPV = primaryVertex.getCov();
+     
+      // calculate impact parameter
+      o2::dataformats::DCA impactParameterCasc;
+      o2::dataformats::DCA impactParameter0;
+      o2::dataformats::DCA impactParameter1;
+      trackCasc.propagateToDCA(primaryVertex, bz, &impactParameterCasc);
+      trackParCovCharmBachelor0.propagateToDCA(primaryVertex, bz, &impactParameter0);
+      trackParCovCharmBachelor1.propagateToDCA(primaryVertex, bz, &impactParameter1);
+
+      // calculate cosine of pointing angle
+      std::array<float, 3> pvCoord = {collision.posX(), collision.posY(), collision.posZ()};
+      float cpaLambda = casc.v0cosPA(collision.posX(), collision.posY(), collision.posZ());
+      float cpaXYLambda = RecoDecay::cpaXY(pvCoord, vertexV0, pVecV0);
+      float cpaXi = casc.casccosPA(collision.posX(), collision.posY(), collision.posZ());
+      float cpaXYXi = RecoDecay::cpaXY(pvCoord, vertexCasc, pVecCasc);
+      float cpaLambdaToXi = RecoDecay::cpa(vertexCasc, vertexV0, pVecV0);
+      float cpaXYLambdaToXi = RecoDecay::cpaXY(vertexCasc, vertexV0, pVecV0);
+
+      // get invariant mass of Xi-pi pairs
+      auto arrayMomentaXiPi0 = std::array{pVecXi, pVecPi0};
+      massXiPi0 = RecoDecay::m(std::move(arrayMomentaXiPi0), std::array{MassXiMinus, MassPiPlus});
+      auto arrayMomentaXiPi1 = std::array{pVecXi, pVecPi1};
+      massXiPi1 = RecoDecay::m(std::move(arrayMomentaXiPi1), std::array{MassXiMinus, MassPiPlus});
+
+      // get uncertainty of the decay length
+      float phi, theta;
+      getPointDirection(std::array{primaryVertex.getX(), primaryVertex.getY(), primaryVertex.getZ()}, secondaryVertex, phi, theta);
+      auto errorDecayLength = std::sqrt(getRotatedCovMatrixXX(covMatrixPV, phi, theta) + getRotatedCovMatrixXX(covMatrixSV, phi, theta));
+      auto errorDecayLengthXY = std::sqrt(getRotatedCovMatrixXX(covMatrixPV, phi, 0.) + getRotatedCovMatrixXX(covMatrixSV, phi, 0.));
+
+      //--------------------- get PID information-----------------------
+      float nSigTpcPiFromXicPlus0 = trackCharmBachelor0.tpcNSigmaPi();
+      float nSigTofPiFromXicPlus0 = trackCharmBachelor0.tofNSigmaPi();
+      float nSigTpcPiFromXicPlus1 = trackCharmBachelor1.tpcNSigmaPi();
+      float nSigTofPiFromXicPlus1 = trackCharmBachelor1.tofNSigmaPi();
+      // Bachelor pion
+      auto trackPionFromXi = casc.bachelor_as<TracksWCovDcaPidPrPi>();
+      float nSigTpcBachelorPi = trackPionFromXi.tpcNSigmaPi();
+      float nSigTofBachelorPi = trackPionFromXi.tofNSigmaPi();
+      // Lambda daughters
+      auto trackPosLambdaDaughter = casc.posTrack_as<TracksWCovDcaPidPrPi>();
+      auto trackNegLambdaDaughter = casc.negTrack_as<TracksWCovDcaPidPrPi>();
+      float pPiFromLambda, pPrFromLambda, nSigTpcPiFromLambda, nSigTofPiFromLambda, nSigTpcPrFromLambda, nSigTofPrFromLambda;
+      if (signXic == +1) {
+        pPiFromLambda = trackNegLambdaDaughter.p();
+        nSigTpcPiFromLambda = trackNegLambdaDaughter.tpcNSigmaPi();
+        nSigTofPiFromLambda = trackNegLambdaDaughter.tofNSigmaPi();
+        pPrFromLambda = trackPosLambdaDaughter.p();
+        nSigTpcPrFromLambda = trackPosLambdaDaughter.tpcNSigmaPr();
+        nSigTofPrFromLambda = trackPosLambdaDaughter.tofNSigmaPr();
+      } else {
+        pPiFromLambda = trackPosLambdaDaughter.p();
+        nSigTpcPiFromLambda = trackPosLambdaDaughter.tpcNSigmaPi();
+        nSigTofPiFromLambda = trackPosLambdaDaughter.tofNSigmaPi();
+        pPrFromLambda = trackNegLambdaDaughter.p();
+        nSigTpcPrFromLambda = trackNegLambdaDaughter.tpcNSigmaPr();
+        nSigTofPrFromLambda = trackNegLambdaDaughter.tofNSigmaPr();
+      }
+
+      //--------------------------------------------fill histograms----------------------------------------------------------------
+      if (fillHistograms) {
+        // invariant mass
+        registry.fill(HIST("hMass3"), massXiPiPi);
+        // covariance matrix elements of PV
+        registry.fill(HIST("hCovPVXX"), covMatrixPV[0]);
+        registry.fill(HIST("hCovPVYY"), covMatrixPV[2]);
+        registry.fill(HIST("hCovPVXZ"), covMatrixPV[3]);
+        registry.fill(HIST("hCovPVZZ"), covMatrixPV[5]);
+        // covariance matrix elements of SV
+        registry.fill(HIST("hCovSVXX"), covMatrixSV[0]);
+        registry.fill(HIST("hCovSVYY"), covMatrixSV[2]);
+        registry.fill(HIST("hCovSVXZ"), covMatrixSV[3]);
+        registry.fill(HIST("hCovSVZZ"), covMatrixSV[5]);
+        // DCAs of prongs
+        registry.fill(HIST("hDcaXYProngs"), trackCasc.getPt(), impactParameterCasc.getY());
+        registry.fill(HIST("hDcaXYProngs"), trackCharmBachelor0.pt(), impactParameter0.getY());
+        registry.fill(HIST("hDcaXYProngs"), trackCharmBachelor1.pt(), impactParameter1.getY());
+        registry.fill(HIST("hDcaZProngs"), trackCasc.getPt(), impactParameterCasc.getZ());
+        registry.fill(HIST("hDcaZProngs"), trackCharmBachelor0.pt(), impactParameter0.getZ());
+        registry.fill(HIST("hDcaZProngs"), trackCharmBachelor1.pt(), impactParameter1.getZ());
+      }
+
+      //---------------------------------fill candidate table rows-------------------------------------------------------------------------------------------
+      rowCandidateBase(collision.globalIndex(),
+                       primaryVertex.getX(), primaryVertex.getY(), primaryVertex.getZ(),
+                       std::sqrt(covMatrixPV[0]), std::sqrt(covMatrixPV[2]), std::sqrt(covMatrixPV[5]),
+                       /*3-prong specific columns*/
+                       rowTrackIndexXicPlus.cascadeId(), rowTrackIndexXicPlus.prong0Id(), rowTrackIndexXicPlus.prong1Id(),
+                       casc.bachelorId(), casc.posTrackId(), casc.negTrackId(),
+                       secondaryVertex[0], secondaryVertex[1], secondaryVertex[2],
+                       std::sqrt(covMatrixSV[0]), std::sqrt(covMatrixSV[2]), std::sqrt(covMatrixSV[5]),
+                       errorDecayLength, errorDecayLengthXY,
+                       chi2SV, massXiPiPi, signXic,
+                       pVecXi[0], pVecXi[1], pVecXi[2],
+                       pVecPi0[0], pVecPi0[1], pVecPi0[2],
+                       pVecPi1[0], pVecPi1[1], pVecPi1[2],
+                       impactParameterCasc.getY(), impactParameter0.getY(), impactParameter1.getY(),
+                       std::sqrt(impactParameterCasc.getSigmaY2()), std::sqrt(impactParameter0.getSigmaY2()), std::sqrt(impactParameter1.getSigmaY2()),
+                       /*cascade specific columns*/
+                       trackPionFromXi.p(), pPiFromLambda, pPrFromLambda,
+                       cpaXi, cpaXYXi, cpaLambda, cpaXYLambda, cpaLambdaToXi, cpaXYLambdaToXi,
+                       casc.mXi(), casc.mLambda(), massXiPi0, massXiPi1,
+                       /*DCA information*/
+                       casc.dcacascdaughters(), casc.dcaV0daughters(), casc.dcapostopv(), casc.dcanegtopv(), casc.dcabachtopv(),
+                       casc.dcaXYCascToPV(), casc.dcaZCascToPV(),
+                       /*PID information*/
+                       nSigTpcPiFromXicPlus0, nSigTpcPiFromXicPlus1, nSigTpcBachelorPi, nSigTpcPiFromLambda, nSigTpcPrFromLambda,
+                       nSigTofPiFromXicPlus0, nSigTofPiFromXicPlus1, nSigTofBachelorPi, nSigTofPiFromLambda, nSigTofPrFromLambda);
+
+        } // end for loop for DCAFitter Xicp
+  //////////////////////////////////////////// NEW CODE ABOVE
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    
+  } // end run DCAFitter for Xicp
+
+  
+  ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+ template <o2::hf_centrality::CentralityEstimator centEstimator, typename Collision>
+  // Run KFParticle with generic 2Prong or 3Prong tracks
+  void runCreatorWithKFParticle(Collision const&,
+				aod::HfCascLf3Prongs const& rowsTrackIndexXicPlus, 
+                                       KFCascadesLinked const&,
+                                       KFCascFull const&,
+                                       TracksWCovExtraPidPrPi const&,
+                                       aod::BCsWithTimestamps const&)
+  {
+    // ...
+
+ for (const auto& rowTrackIndexXicPlus : rowsTrackIndexXicPlus) {
+      if (fillHistograms) {
+        registry.fill(HIST("hCandCounter"), TotalSkimmedTriplets);
+      }
+
+      // check if the event is selected
+      auto collision = rowTrackIndexXicPlus.collision_as<Collision>();
+        float centrality{-1.f};
+      // const auto rejectionMask = hfEvSel.getHfCollisionRejectionMask<true, centEstimator, aod::BCsWithTimestamps>(collision, centrality, ccdb, registry);
+      // if (rejectionMask != 0) {
+      //   /// at least one event selection not satisfied --> reject the candidate
+      //   continue;
+      // }
+      // if (fillHistograms) {
+      //   registry.fill(HIST("hCandCounter"), SelEvent);
+      // }
+
+      // Retrieve skimmed cascade and pion tracks
+      auto cascAodElement = rowTrackIndexXicPlus.cascade_as<aod::KFCascadesLinked>();
+      if (!cascAodElement.has_kfCascData()) {
+        continue;
+      }
+      auto casc = cascAodElement.kfCascData_as<KFCascFull>();
+      auto trackCharmBachelor0 = rowTrackIndexXicPlus.prong0_as<TracksWCovExtraPidPrPi>();
+      auto trackCharmBachelor1 = rowTrackIndexXicPlus.prong1_as<TracksWCovExtraPidPrPi>();
+
+      //-------------------preselect cascade candidates--------------------------------------
+      if (doCascadePreselection) {
+        if (std::abs(casc.dcaXYCascToPV()) > dcaXYToPVCascadeMax) {
+          continue;
+        }
+        if (std::abs(casc.mXi() - MassXiMinus) > massToleranceCascade) {
+          continue;
+        }
+      }
+      if (fillHistograms) {
+        registry.fill(HIST("hCandCounter"), CascPreSel);
+      }
+
+      //----------------------Set the magnetic field from ccdb-----------------------------
+      /// The static instance of the propagator was already modified in the HFTrackIndexSkimCreator,
+      /// but this is not true when running on Run2 data/MC already converted into AO2Ds.
+      auto bc = collision.template bc_as<aod::BCsWithTimestamps>();
+      if (runNumber != bc.runNumber()) {
+        LOG(info) << ">>>>>>>>>>>> Current run number: " << runNumber;
+        initCCDB(bc, runNumber, ccdb, isRun2 ? ccdbPathGrp : ccdbPathGrpMag, lut, isRun2);
+        bz = o2::base::Propagator::Instance()->getNominalBz();
+        LOG(info) << ">>>>>>>>>>>> Magnetic field: " << bz;
+      }
+      KFParticle::SetField(bz);
+
+      //----------------------info of V0 and cascade tracks from LF-table------------------
+      std::array<float, 3> vertexV0 = {casc.xlambda(), casc.ylambda(), casc.zlambda()};
+      std::array<float, 3> pVecV0 = {casc.pxlambda(), casc.pylambda(), casc.pzlambda()};
+      std::array<float, 3> vertexCasc = {casc.x(), casc.y(), casc.z()};
+      std::array<float, 3> pVecCasc = {casc.px(), casc.py(), casc.pz()};
+
+      //----------------------Create XicPlus as KFParticle object-------------------------------------------
+      // initialize primary vertex
+      KFPVertex kfpVertex = createKFPVertexFromCollision(collision);
+      float covMatrixPV[6];
+      kfpVertex.GetCovarianceMatrix(covMatrixPV);
+      KFParticle kfPv(kfpVertex); // for calculation of DCAs to PV
+
+      // convert pion tracks into KFParticle object
+      KFPTrack kfpTrackCharmBachelor0 = createKFPTrackFromTrack(trackCharmBachelor0);
+      KFPTrack kfpTrackCharmBachelor1 = createKFPTrackFromTrack(trackCharmBachelor1);
+      KFParticle kfCharmBachelor0(kfpTrackCharmBachelor0, kPiPlus);
+      KFParticle kfCharmBachelor1(kfpTrackCharmBachelor1, kPiPlus);
+
+      // create Xi as KFParticle object
+      // read {X,Y,Z,Px,Py,Pz} and corresponding covariance matrix from KF cascade Tables
+      constexpr std::size_t NElementsStateVector{6};
+      std::array<float, NElementsStateVector> xyzpxpypz = {casc.x(), casc.y(), casc.z(), casc.px(), casc.py(), casc.pz()};
+      float parPosMom[NElementsStateVector];
+      std::copy(xyzpxpypz.begin(), xyzpxpypz.end(), parPosMom);
+      // create KFParticle
+      KFParticle kfXi;
+      float massXi = casc.mXi();
+      kfXi.Create(parPosMom, casc.kfTrackCovMat(), casc.sign(), massXi);
+      if (useXiMassConstraint) {
+        kfXi.SetNonlinearMassConstraint(MassXiMinus);
+      }
+
+      // create XicPlus as KFParticle object
+      KFParticle kfXicPlus;
+      const KFParticle* kfDaughtersXicPlus[3] = {&kfCharmBachelor0, &kfCharmBachelor1, &kfXi};
+      kfXicPlus.SetConstructMethod(kfConstructMethod);
+      try {
+        kfXicPlus.Construct(kfDaughtersXicPlus, 3);
+      } catch (std::runtime_error& e) {
+        LOG(debug) << "Failed to construct XicPlus : " << e.what();
+        continue;
+      }
+      if (fillHistograms) {
+        registry.fill(HIST("hCandCounter"), VertexFit);
+      }
+
+      // get geometrical chi2 of XicPlus
+      float chi2GeoXicPlus = kfXicPlus.GetChi2() / kfXicPlus.GetNDF();
+
+      // topological constraint of Xic to PV
+      float chi2topoXicPlusToPVBeforeConstraint = kfXicPlus.GetDeviationFromVertex(kfPv);
+      KFParticle kfXicPlusToPV = kfXicPlus;
+      kfXicPlusToPV.SetProductionVertex(kfPv);
+      float chi2topoXicPlusToPV = kfXicPlusToPV.GetChi2() / kfXicPlusToPV.GetNDF();
+      if (constrainXicPlusToPv) {
+        kfXicPlus = kfXicPlusToPV;
+        kfXicPlus.TransportToDecayVertex();
+      }
+
+      // topological constraint of Xi to XicPlus
+      float chi2topoXiToXicPlusBeforeConstraint = kfXi.GetDeviationFromVertex(kfXicPlus);
+      KFParticle kfXiToXicPlus = kfXi;
+      kfXiToXicPlus.SetProductionVertex(kfXicPlus);
+      float chi2topoXiToXicPlus = kfXiToXicPlus.GetChi2() / kfXiToXicPlus.GetNDF();
+      kfXiToXicPlus.TransportToDecayVertex();
+      if (constrainXiToXicPlus) {
+        KFParticle kfXicPlusWithXiToXicPlus;
+        const KFParticle* kfDaughtersXicPlusWithXiToXicPlus[3] = {&kfCharmBachelor0, &kfCharmBachelor1, &kfXiToXicPlus};
+        kfXicPlusWithXiToXicPlus.SetConstructMethod(kfConstructMethod);
+        try {
+          kfXicPlusWithXiToXicPlus.Construct(kfDaughtersXicPlusWithXiToXicPlus, 3);
+        } catch (std::runtime_error& e) {
+          LOG(debug) << "Failed to construct XicPlus with Xi connstrained to XicPlus: " << e.what();
+          continue;
+        }
+        kfXicPlus = kfXicPlusWithXiToXicPlus;
+      }
+
+      // get covariance matrix of XicPlus
+      auto covMatrixXicPlus = kfXicPlus.CovarianceMatrix();
+
+      //---------------------calculate physical parameters of XicPlus candidate----------------------
+      // sign of charm baryon
+      int signXic = casc.sign() < 0 ? +1 : -1;
+
+      // transport XicPlus daughters to XicPlus decay vertex (secondary vertex)
+      float secondaryVertex[3] = {0.};
+      secondaryVertex[0] = kfXicPlus.GetX();
+      secondaryVertex[1] = kfXicPlus.GetY();
+      secondaryVertex[2] = kfXicPlus.GetZ();
+      kfXi.TransportToPoint(secondaryVertex);
+      kfCharmBachelor0.TransportToPoint(secondaryVertex);
+      kfCharmBachelor1.TransportToPoint(secondaryVertex);
+
+      // get impact parameters of XicPlus daughters
+      float impactParameterPi0XY = 0., errImpactParameterPi0XY = 0.;
+      float impactParameterPi1XY = 0., errImpactParameterPi1XY = 0.;
+      float impactParameterXiXY = 0., errImpactParameterXiXY = 0.;
+      kfCharmBachelor0.GetDistanceFromVertexXY(kfPv, impactParameterPi0XY, errImpactParameterPi0XY);
+      kfCharmBachelor1.GetDistanceFromVertexXY(kfPv, impactParameterPi1XY, errImpactParameterPi1XY);
+      kfXi.GetDistanceFromVertexXY(kfPv, impactParameterXiXY, errImpactParameterXiXY);
+
+      // calculate cosine of pointing angle
+      std::array<float, 3> pvCoord = {collision.posX(), collision.posY(), collision.posZ()};
+      float cpaLambda = casc.v0cosPA(collision.posX(), collision.posY(), collision.posZ());
+      float cpaXYLambda = RecoDecay::cpaXY(pvCoord, vertexV0, pVecV0);
+      float cpaXi = casc.casccosPA(collision.posX(), collision.posY(), collision.posZ());
+      float cpaXYXi = RecoDecay::cpaXY(pvCoord, vertexCasc, pVecCasc);
+      float cpaLambdaToXi = RecoDecay::cpa(vertexCasc, vertexV0, pVecV0);
+      float cpaXYLambdaToXi = RecoDecay::cpaXY(vertexCasc, vertexV0, pVecV0);
+
+      // get DCAs of Pi0-Pi1, Pi0-Xi, Pi1-Xi
+      float dcaXYPi0Pi1 = kfCharmBachelor0.GetDistanceFromParticleXY(kfCharmBachelor1);
+      float dcaXYPi0Xi = kfCharmBachelor0.GetDistanceFromParticleXY(kfXi);
+      float dcaXYPi1Xi = kfCharmBachelor1.GetDistanceFromParticleXY(kfXi);
+      float dcaPi0Pi1 = kfCharmBachelor0.GetDistanceFromParticle(kfCharmBachelor1);
+      float dcaPi0Xi = kfCharmBachelor0.GetDistanceFromParticle(kfXi);
+      float dcaPi1Xi = kfCharmBachelor1.GetDistanceFromParticle(kfXi);
+
+      // mass of Xi-Pi0 pair
+      KFParticle kfXiPi0;
+      float errMassXiPi0;
+      const KFParticle* kfXiResonanceDaughtersPi0[2] = {&kfXi, &kfCharmBachelor0};
+      kfXiPi0.SetConstructMethod(kfConstructMethod);
+      try {
+        kfXiPi0.Construct(kfXiResonanceDaughtersPi0, 2);
+      } catch (...) {
+        LOG(info) << "Failed to construct Xi(1530) with Pi 0";
+      }
+      kfXiPi0.GetMass(massXiPi0, errMassXiPi0);
+
+      // mass of Xi-Pi1 pair
+      KFParticle kfXiPi1;
+      float errMassXiPi1;
+      const KFParticle* kfXiResonanceDaughtersPi1[2] = {&kfXi, &kfCharmBachelor1};
+      kfXiPi1.SetConstructMethod(kfConstructMethod);
+      try {
+        kfXiPi1.Construct(kfXiResonanceDaughtersPi1, 2);
+      } catch (...) {
+        LOG(info) << "Failed to construct Xi(1530) with Pi 1";
+      }
+      kfXiPi1.GetMass(massXiPi1, errMassXiPi1);
+
+      // get invariant mass of Xic candidate
+      float errMassXiPiPi;
+      kfXicPlus.GetMass(massXiPiPi, errMassXiPiPi);
+
+      // decay length of XicPlus
+      // use XicPlus constrained to PV (kfXicPlusToPV), since production point must be set before calling GetDecayLength(XY) on KFParticle
+      float kfDecayLength = 0., errorKfDecayLength = 0., kfDecayLengthXY = 0., errorKfDecayLengthXY = 0.;
+      kfXicPlusToPV.GetDecayLength(kfDecayLength, errorKfDecayLength);
+      kfXicPlusToPV.GetDecayLengthXY(kfDecayLengthXY, errorKfDecayLengthXY);
+      float kfDecayLengthNormalised = ldlFromKF(kfXicPlus, kfPv);
+      float kfDecayLengthXYNormalised = ldlXYFromKF(kfXicPlus, kfPv);
+
+      //--------------------- get PID information-----------------------
+      float nSigTpcPiFromXicPlus0 = trackCharmBachelor0.tpcNSigmaPi();
+      float nSigTofPiFromXicPlus0 = trackCharmBachelor0.tofNSigmaPi();
+      float nSigTpcPiFromXicPlus1 = trackCharmBachelor1.tpcNSigmaPi();
+      float nSigTofPiFromXicPlus1 = trackCharmBachelor1.tofNSigmaPi();
+      // Bachelor pion
+      auto trackPionFromXi = casc.bachelor_as<TracksWCovExtraPidPrPi>();
+      float nSigTpcBachelorPi = trackPionFromXi.tpcNSigmaPi();
+      float nSigTofBachelorPi = trackPionFromXi.tofNSigmaPi();
+      // Lambda daughters
+      auto trackPosLambdaDaughter = casc.posTrack_as<TracksWCovExtraPidPrPi>();
+      auto trackNegLambdaDaughter = casc.negTrack_as<TracksWCovExtraPidPrPi>();
+      float pPiFromLambda, pPrFromLambda, nSigTpcPiFromLambda, nSigTofPiFromLambda, nSigTpcPrFromLambda, nSigTofPrFromLambda;
+      if (signXic == +1) {
+        pPiFromLambda = trackNegLambdaDaughter.p();
+        nSigTpcPiFromLambda = trackNegLambdaDaughter.tpcNSigmaPi();
+        nSigTofPiFromLambda = trackNegLambdaDaughter.tofNSigmaPi();
+        pPrFromLambda = trackPosLambdaDaughter.p();
+        nSigTpcPrFromLambda = trackPosLambdaDaughter.tpcNSigmaPr();
+        nSigTofPrFromLambda = trackPosLambdaDaughter.tofNSigmaPr();
+      } else {
+        pPiFromLambda = trackPosLambdaDaughter.p();
+        nSigTpcPiFromLambda = trackPosLambdaDaughter.tpcNSigmaPi();
+        nSigTofPiFromLambda = trackPosLambdaDaughter.tofNSigmaPi();
+        pPrFromLambda = trackNegLambdaDaughter.p();
+        nSigTpcPrFromLambda = trackNegLambdaDaughter.tpcNSigmaPr();
+        nSigTofPrFromLambda = trackNegLambdaDaughter.tofNSigmaPr();
+      }
+   
+      //-------------------------------fill histograms--------------------------------------------
+      if (fillHistograms) {
+        // invariant mass
+        registry.fill(HIST("hMass3"), massXiPiPi);
+        // covariance matrix elements of PV
+        registry.fill(HIST("hCovPVXX"), covMatrixPV[0]);
+        registry.fill(HIST("hCovPVYY"), covMatrixPV[2]);
+        registry.fill(HIST("hCovPVXZ"), covMatrixPV[3]);
+        registry.fill(HIST("hCovPVZZ"), covMatrixPV[5]);
+        // covariance matrix elements of SV
+        registry.fill(HIST("hCovSVXX"), covMatrixXicPlus[0]);
+        registry.fill(HIST("hCovSVYY"), covMatrixXicPlus[2]);
+        registry.fill(HIST("hCovSVXZ"), covMatrixXicPlus[3]);
+        registry.fill(HIST("hCovSVZZ"), covMatrixXicPlus[5]);
+        // DCAs of prongs
+        registry.fill(HIST("hDcaXYProngs"), kfXi.GetPt(), impactParameterXiXY);
+        registry.fill(HIST("hDcaXYProngs"), kfCharmBachelor0.GetPt(), impactParameterPi0XY);
+        registry.fill(HIST("hDcaXYProngs"), kfCharmBachelor1.GetPt(), impactParameterPi1XY);
+      }
+
+      //------------------------------fill candidate table rows--------------------------------------
+      rowCandidateBase(collision.globalIndex(),
+                       kfPv.GetX(), kfPv.GetY(), kfPv.GetZ(),
+                       std::sqrt(covMatrixPV[0]), std::sqrt(covMatrixPV[2]), std::sqrt(covMatrixPV[5]),
+                       /*3-prong specific columns*/
+                       rowTrackIndexXicPlus.cascadeId(), rowTrackIndexXicPlus.prong0Id(), rowTrackIndexXicPlus.prong1Id(),
+                       casc.bachelorId(), casc.posTrackId(), casc.negTrackId(),
+                       secondaryVertex[0], secondaryVertex[1], secondaryVertex[2],
+                       kfXicPlus.GetErrX(), kfXicPlus.GetErrY(), kfXicPlus.GetErrZ(),
+                       errorKfDecayLength, errorKfDecayLengthXY,
+                       chi2GeoXicPlus, massXiPiPi, signXic,
+                       kfXi.GetPx(), kfXi.GetPy(), kfXi.GetPz(),
+                       kfCharmBachelor0.GetPx(), kfCharmBachelor0.GetPy(), kfCharmBachelor0.GetPz(),
+                       kfCharmBachelor1.GetPx(), kfCharmBachelor1.GetPy(), kfCharmBachelor1.GetPz(),
+                       impactParameterXiXY, impactParameterPi0XY, impactParameterPi1XY,
+                       errImpactParameterXiXY, errImpactParameterPi0XY, errImpactParameterPi1XY,
+                       /*cascade specific columns*/
+                       trackPionFromXi.p(), pPiFromLambda, pPrFromLambda,
+                       cpaXi, cpaXYXi, cpaLambda, cpaXYLambda, cpaLambdaToXi, cpaXYLambdaToXi,
+                       massXi, casc.mLambda(), massXiPi0, massXiPi1,
+                       /*DCA information*/
+                       casc.dcacascdaughters(), casc.dcaV0daughters(), casc.dcapostopv(), casc.dcanegtopv(), casc.dcabachtopv(),
+                       casc.dcaXYCascToPV(), casc.dcaZCascToPV(),
+                       /*PID information*/
+                       nSigTpcPiFromXicPlus0, nSigTpcPiFromXicPlus1, nSigTpcBachelorPi, nSigTpcPiFromLambda, nSigTpcPrFromLambda,
+                       nSigTofPiFromXicPlus0, nSigTofPiFromXicPlus1, nSigTofBachelorPi, nSigTofPiFromLambda, nSigTofPrFromLambda);
+      rowCandidateKF(casc.kfCascadeChi2(), casc.kfV0Chi2(),
+                     kfDecayLength, kfDecayLengthNormalised, kfDecayLengthXY, kfDecayLengthXYNormalised,
+                     chi2topoXicPlusToPVBeforeConstraint, chi2topoXicPlusToPV, chi2topoXiToXicPlusBeforeConstraint, chi2topoXiToXicPlus,
+                     dcaXYPi0Pi1, dcaXYPi0Xi, dcaXYPi1Xi,
+                     dcaPi0Pi1, dcaPi0Xi, dcaPi1Xi);
+      
+     } // end for loop KFParticle for Xicp
+
+    
+  } // end KFParticle for Xicp
+ ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+
+  // DCAFitter runXic0
+   ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+ template <o2::hf_centrality::CentralityEstimator centEstimator, typename Collision>
+ // Run KFParticle with 2Prong tracks
+  void runCreatorWithDCAFitterNXic0(Collision const&,
+				aod::HfCascLf2Prongs const& rowsTrackIndexXicZero, 
+                                       CascadesLinked const&,
+                                       CascFull const&,
+                                       TracksWCovDcaPidPrPi const&,
+                                       aod::BCsWithTimestamps const&)
+  {
+
+
+    
+   for (const auto& rowTrackIndexXicZero : rowsTrackIndexXicZero)
+     {
+       if (fillHistograms)
+	 {
+	   registry.fill(HIST("hCandCounter"), TotalSkimmedTriplets);
+	 }
+
+       // check if the event is selected
+       ///////////////////////////////////////////////////////////////////// HF Event Selections keeps giving error
+       auto collision = rowTrackIndexXicZero.collision_as<Collision>();
+       float centrality{-1.f};
+       // const auto rejectionMask = hfEvSel.getHfCollisionRejectionMask<true, centEstimator, aod::BCsWithTimestamps>(collision, centrality, ccdb, registry);
+       // if (rejectionMask != 0) {
+       //   /// at least one event selection not satisfied --> reject the candidate
+       //   continue;
+       // }
+       // if (fillHistograms) {
+       //   registry.fill(HIST("hCandCounter"), SelEvent);
+       // }
+       ///////////////////////////////////////////////////////////////////// HF Event Selections keeps giving error
+
+       // Retrieve skimmed cascade and pion tracks
+       auto cascAodElement = rowTrackIndexXicZero.cascade_as<CascadesLinked>();
+       if (!cascAodElement.has_cascData())
+	 {
+	   continue;
+	 }
+       auto casc = cascAodElement.cascData_as<CascFull>();
+       auto trackCharmBachelor0 = rowTrackIndexXicZero.prong0_as<TracksWCovDcaPidPrPi>();
+       // auto trackCharmBachelor1 = rowTrackIndexXicZero.prong1_as<TracksWCovDcaPidPrPi>();
+       
+       // preselect cascade candidates
+       if (doCascadePreselection)
+	 {
+	   if (std::abs(casc.dcaXYCascToPV()) > dcaXYToPVCascadeMax)
+	     {
+	       continue;
+	     }
+	   if (std::abs(casc.mXi() - MassXiMinus) > massToleranceCascade)
+	     {
+	       continue;
+	     }
+	 }
+       if (fillHistograms)
+	 {
+	   registry.fill(HIST("hCandCounter"), CascPreSel);
+	 }
+       
+       //----------------------Set the magnetic field from ccdb---------------------------------------
+       /// The static instance of the propagator was already modified in the HFTrackIndexSkimCreator,
+       /// but this is not true when running on Run2 data/MC already converted into AO2Ds.
+       auto bc = collision.template bc_as<aod::BCsWithTimestamps>();
+       if (runNumber != bc.runNumber())
+	 {
+	   LOG(info) << ">>>>>>>>>>>> Current run number: " << runNumber;
+	   initCCDB(bc, runNumber, ccdb, isRun2 ? ccdbPathGrp : ccdbPathGrpMag, lut, isRun2);
+	   bz = o2::base::Propagator::Instance()->getNominalBz();
+	   LOG(info) << ">>>>>>>>>>>> Magnetic field: " << bz;
+	 }
+       df2.setBz(bz);
+       
+       //--------------------------info of V0 and cascades track from LF-tables---------------------------
+       std::array<float, 3> vertexV0 = {casc.xlambda(), casc.ylambda(), casc.zlambda()};
+       std::array<float, 3> pVecV0 = {casc.pxlambda(), casc.pylambda(), casc.pzlambda()};
+       std::array<float, 3> vertexCasc = {casc.x(), casc.y(), casc.z()};
+       std::array<float, 3> pVecCasc = {casc.px(), casc.py(), casc.pz()};
+       std::array<float, 21> covCasc = {0.};
+
+       //----------------create cascade track------------------------------------------------------------
+       constexpr std::size_t NElementsCovMatrix{6u};
+       constexpr std::array<int, NElementsCovMatrix> MomInd = {9, 13, 14, 18, 19, 20}; // cov matrix elements for momentum component
+       for (auto i = 0u; i < NElementsCovMatrix; i++)
+	 {
+	   covCasc[i] = casc.positionCovMat()[i];
+	   covCasc[MomInd[i]] = casc.momentumCovMat()[i];
+	 }
+       
+       // create cascade track
+       o2::track::TrackParCov trackCasc;
+       if (casc.sign() > 0)
+	 {
+	   trackCasc = o2::track::TrackParCov(vertexCasc, pVecCasc, covCasc, 1, true);
+	 }
+       else if (casc.sign() < 0)
+	 {
+	   trackCasc = o2::track::TrackParCov(vertexCasc, pVecCasc, covCasc, -1, true);
+	 }
+       else
+	 {
+	 continue;
+	 }
+       trackCasc.setAbsCharge(1);
+       trackCasc.setPID(o2::track::PID::XiMinus);
+
+       //----------------------------fit SV and create XicZero track------------------
+       auto trackParCovCharmBachelor0 = getTrackParCov(trackCharmBachelor0);
+       // auto trackParCovCharmBachelor1 = getTrackParCov(trackCharmBachelor1);
+
+       // reconstruct the 2-prong secondary vertex
+       try
+	 {
+	   if (df2.process(trackCasc, trackParCovCharmBachelor0) == 0)
+	     {
+	       continue;
+	     }
+	 }
+       catch (const std::runtime_error& error)
+	 {
+	   LOG(info) << "Run time error found: " << error.what() << ". DCAFitterN cannot work, skipping the candidate.";
+	   continue;
+	 }
+       if (fillHistograms)
+	 {
+	   registry.fill(HIST("hCandCounter"), VertexFit);
+	 }
+       
+       //----------------------------calculate physical properties-----------------------
+       // Charge of charm baryon
+       int signXic = casc.sign() < 0 ? +1 : -1;
+
+       // get SV properties
+       const auto& secondaryVertex = df2.getPCACandidate();
+       auto chi2SV = df2.getChi2AtPCACandidate();
+       auto covMatrixSV = df2.calcPCACovMatrixFlat();
+
+       // get track momenta
+       trackCasc = df2.getTrack(0);
+       trackParCovCharmBachelor0 = df2.getTrack(1);
+       //  trackParCovCharmBachelor1 = df.getTrack(2);
+       std::array<float, 3> pVecXi;
+       std::array<float, 3> pVecPi0;
+       // std::array<float, 3> pVecPi1;
+       trackCasc.getPxPyPzGlo(pVecXi);
+       trackParCovCharmBachelor0.getPxPyPzGlo(pVecPi0);
+       // trackParCovCharmBachelor1.getPxPyPzGlo(pVecPi1);
+
+       // get invariant mass of Xic candidate
+       auto arrayMomenta = std::array{pVecXi, pVecPi0};
+       massXiPi = RecoDecay::m(std::move(arrayMomenta), std::array{MassXiMinus, MassPiPlus});
+
+       // get track impact parameters
+       // This modifies track momenta!
+       auto primaryVertex = getPrimaryVertex(collision);
+       auto covMatrixPV = primaryVertex.getCov();
+       // calculate impact parameter
+       o2::dataformats::DCA impactParameterCasc;
+       o2::dataformats::DCA impactParameter0;
+       //  o2::dataformats::DCA impactParameter1;
+       trackCasc.propagateToDCA(primaryVertex, bz, &impactParameterCasc);
+       trackParCovCharmBachelor0.propagateToDCA(primaryVertex, bz, &impactParameter0);
+       // trackParCovCharmBachelor1.propagateToDCA(primaryVertex, bz, &impactParameter1);
+
+       // calculate cosine of pointing angle
+       std::array<float, 3> pvCoord = {collision.posX(), collision.posY(), collision.posZ()};
+       float cpaLambda = casc.v0cosPA(collision.posX(), collision.posY(), collision.posZ());
+       float cpaXYLambda = RecoDecay::cpaXY(pvCoord, vertexV0, pVecV0);
+       float cpaXi = casc.casccosPA(collision.posX(), collision.posY(), collision.posZ());
+       float cpaXYXi = RecoDecay::cpaXY(pvCoord, vertexCasc, pVecCasc);
+       float cpaLambdaToXi = RecoDecay::cpa(vertexCasc, vertexV0, pVecV0);
+       float cpaXYLambdaToXi = RecoDecay::cpaXY(vertexCasc, vertexV0, pVecV0);
+
+       // get invariant mass of Xi-pi pair
+       auto arrayMomentaXiPi0 = std::array{pVecXi, pVecPi0};
+       massXiPi0 = RecoDecay::m(std::move(arrayMomentaXiPi0), std::array{MassXiMinus, MassPiPlus});
+       // auto arrayMomentaXiPi1 = std::array{pVecXi, pVecPi1};
+       // massXiPi1 = RecoDecay::m(std::move(arrayMomentaXiPi1), std::array{MassXiMinus, MassPiPlus});
+
+       // get uncertainty of the decay length
+       float phi, theta;
+       getPointDirection(std::array{primaryVertex.getX(), primaryVertex.getY(), primaryVertex.getZ()}, secondaryVertex, phi, theta);
+       auto errorDecayLength = std::sqrt(getRotatedCovMatrixXX(covMatrixPV, phi, theta) + getRotatedCovMatrixXX(covMatrixSV, phi, theta));
+       auto errorDecayLengthXY = std::sqrt(getRotatedCovMatrixXX(covMatrixPV, phi, 0.) + getRotatedCovMatrixXX(covMatrixSV, phi, 0.));
+
+       //--------------------- get PID information-----------------------
+       float nSigTpcPiFromXicZero0 = trackCharmBachelor0.tpcNSigmaPi();
+       float nSigTofPiFromXicZero0 = trackCharmBachelor0.tofNSigmaPi();
+       // float nSigTpcPiFromXicZero1 = trackCharmBachelor1.tpcNSigmaPi();
+       // float nSigTofPiFromXicZero1 = trackCharmBachelor1.tofNSigmaPi();
+       // Bachelor pion
+       auto trackPionFromXi = casc.bachelor_as<TracksWCovDcaPidPrPi>();
+       float nSigTpcBachelorPi = trackPionFromXi.tpcNSigmaPi();
+       float nSigTofBachelorPi = trackPionFromXi.tofNSigmaPi();
+       // Lambda daughters
+       auto trackPosLambdaDaughter = casc.posTrack_as<TracksWCovDcaPidPrPi>();
+       auto trackNegLambdaDaughter = casc.negTrack_as<TracksWCovDcaPidPrPi>();
+       float pPiFromLambda, pPrFromLambda, nSigTpcPiFromLambda, nSigTofPiFromLambda, nSigTpcPrFromLambda, nSigTofPrFromLambda;
+       if (signXic == +1)
+	 {
+	   pPiFromLambda = trackNegLambdaDaughter.p();
+	   nSigTpcPiFromLambda = trackNegLambdaDaughter.tpcNSigmaPi();
+	   nSigTofPiFromLambda = trackNegLambdaDaughter.tofNSigmaPi();
+	   pPrFromLambda = trackPosLambdaDaughter.p();
+	   nSigTpcPrFromLambda = trackPosLambdaDaughter.tpcNSigmaPr();
+	   nSigTofPrFromLambda = trackPosLambdaDaughter.tofNSigmaPr();
+	 }
+       else
+	 {
+	   pPiFromLambda = trackPosLambdaDaughter.p();
+	   nSigTpcPiFromLambda = trackPosLambdaDaughter.tpcNSigmaPi();
+	   nSigTofPiFromLambda = trackPosLambdaDaughter.tofNSigmaPi();
+	   pPrFromLambda = trackNegLambdaDaughter.p();
+	   nSigTpcPrFromLambda = trackNegLambdaDaughter.tpcNSigmaPr();
+	   nSigTofPrFromLambda = trackNegLambdaDaughter.tofNSigmaPr();
+	 }
+
+      //--------------------------------------------fill histograms----------------------------------------------------------------
+      if (fillHistograms)
+	{
+	  // invariant mass
+	  registry.fill(HIST("hMass3"), massXiPi);
+	  // covariance matrix elements of PV
+	  registry.fill(HIST("hCovPVXX"), covMatrixPV[0]);
+	  registry.fill(HIST("hCovPVYY"), covMatrixPV[2]);
+	  registry.fill(HIST("hCovPVXZ"), covMatrixPV[3]);
+	  registry.fill(HIST("hCovPVZZ"), covMatrixPV[5]);
+	  // covariance matrix elements of SV
+	  registry.fill(HIST("hCovSVXX"), covMatrixSV[0]);
+	  registry.fill(HIST("hCovSVYY"), covMatrixSV[2]);
+	  registry.fill(HIST("hCovSVXZ"), covMatrixSV[3]);
+	  registry.fill(HIST("hCovSVZZ"), covMatrixSV[5]);
+	  // DCAs of prongs
+	  registry.fill(HIST("hDcaXYProngs"), trackCasc.getPt(), impactParameterCasc.getY());
+	  registry.fill(HIST("hDcaXYProngs"), trackCharmBachelor0.pt(), impactParameter0.getY());
+	  //   registry.fill(HIST("hDcaXYProngs"), trackCharmBachelor1.pt(), impactParameter1.getY());
+	  registry.fill(HIST("hDcaZProngs"), trackCasc.getPt(), impactParameterCasc.getZ());
+	  registry.fill(HIST("hDcaZProngs"), trackCharmBachelor0.pt(), impactParameter0.getZ());
+	  //  registry.fill(HIST("hDcaZProngs"), trackCharmBachelor1.pt(), impactParameter1.getZ());
+	}
+      
+      // set 3-prong variables to zero
+      float dummy = 0;
+      
+      //---------------------------------fill candidate table rows-------------------------------------------------------------------------------------------
+       rowCandidateBase(collision.globalIndex(),
+                       primaryVertex.getX(), primaryVertex.getY(), primaryVertex.getZ(),
+                       std::sqrt(covMatrixPV[0]), std::sqrt(covMatrixPV[2]), std::sqrt(covMatrixPV[5]),
+                       /*3-prong specific columns*/
+                       rowTrackIndexXicZero.cascadeId(), rowTrackIndexXicZero.prong0Id(), dummy,
+                       casc.bachelorId(), casc.posTrackId(), casc.negTrackId(),
+                       secondaryVertex[0], secondaryVertex[1], secondaryVertex[2],
+                       std::sqrt(covMatrixSV[0]), std::sqrt(covMatrixSV[2]), std::sqrt(covMatrixSV[5]),
+                       errorDecayLength, errorDecayLengthXY,
+                       chi2SV, massXiPi, signXic,
+                       pVecXi[0], pVecXi[1], pVecXi[2],
+                       pVecPi0[0], pVecPi0[1], pVecPi0[2],
+                       dummy, dummy, dummy,
+                       impactParameterCasc.getY(), impactParameter0.getY(), dummy,
+                       std::sqrt(impactParameterCasc.getSigmaY2()), std::sqrt(impactParameter0.getSigmaY2()), dummy,
+                       /*cascade specific columns*/
+                       trackPionFromXi.p(), pPiFromLambda, pPrFromLambda,
+                       cpaXi, cpaXYXi, cpaLambda, cpaXYLambda, cpaLambdaToXi, cpaXYLambdaToXi,
+                       casc.mXi(), casc.mLambda(), massXiPi0, dummy,
+                       /*DCA information*/
+                       casc.dcacascdaughters(), casc.dcaV0daughters(), casc.dcapostopv(), casc.dcanegtopv(), casc.dcabachtopv(),
+                       casc.dcaXYCascToPV(), casc.dcaZCascToPV(),
+                       /*PID information*/
+                       nSigTpcPiFromXicZero0, dummy, nSigTpcBachelorPi, nSigTpcPiFromLambda, nSigTpcPrFromLambda,
+                       nSigTofPiFromXicZero0, dummy, nSigTofBachelorPi, nSigTofPiFromLambda, nSigTofPrFromLambda);
+      
+     } // End for loop DCA Xic0
+   
+
+   
+  } // end run DCA Xic0
+
+  // KFParticle runXic0
+   ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+ template <o2::hf_centrality::CentralityEstimator centEstimator, typename Collision>
+  // Run KFParticle with 2Prong tracks
+  void runCreatorWithKFParticleXic0(Collision const&,
+				    aod::HfCascLf2Prongs const& rowsTrackIndexXicZero, 
+                                       KFCascadesLinked const&,
+                                       KFCascFull const&,
+                                       TracksWCovExtraPidPrPi const&,
+                                       aod::BCsWithTimestamps const&)
+  {
+
+
+
+    
+
+    
+   for (const auto& rowTrackIndexXicZero : rowsTrackIndexXicZero) {
+      if (fillHistograms) {
+        registry.fill(HIST("hCandCounter"), TotalSkimmedTriplets);
+      }
+
+      // check if the event is selected
+      ///////////////////////////////////////////////////////////////////// HF Event Selections keeps giving error
+      auto collision = rowTrackIndexXicZero.collision_as<Collision>();
+      float centrality{-1.f};
+      // const auto rejectionMask = hfEvSel.getHfCollisionRejectionMask<true, centEstimator, aod::BCsWithTimestamps>(collision, centrality, ccdb, registry);
+      // if (rejectionMask != 0) {
+      //   /// at least one event selection not satisfied --> reject the candidate
+      //   continue;
+      // }
+      // if (fillHistograms) {
+      //   registry.fill(HIST("hCandCounter"), SelEvent);
+      // }
+       ///////////////////////////////////////////////////////////////////// HF Event Selections keeps giving error
+
+       // Retrieve skimmed cascade and pion tracks
+      auto cascAodElement = rowTrackIndexXicZero.cascade_as<aod::KFCascadesLinked>();
+      if (!cascAodElement.has_kfCascData()) {
+        continue;
+      }
+      auto casc = cascAodElement.kfCascData_as<KFCascFull>();
+      auto trackCharmBachelor0 = rowTrackIndexXicZero.prong0_as<TracksWCovExtraPidPrPi>();
+      // auto trackCharmBachelor1 = rowTrackIndexXicZero.prong1_as<TracksWCovExtraPidPrPi>();
+
+      //-------------------preselect cascade candidates--------------------------------------
+      if (doCascadePreselection) {
+        if (std::abs(casc.dcaXYCascToPV()) > dcaXYToPVCascadeMax) {
+          continue;
+        }
+        if (std::abs(casc.mXi() - MassXiMinus) > massToleranceCascade) {
+          continue;
+        }
+      }
+      if (fillHistograms) {
+        registry.fill(HIST("hCandCounter"), CascPreSel);
+      }
+      
+       //----------------------Set the magnetic field from ccdb-----------------------------
+      /// The static instance of the propagator was already modified in the HFTrackIndexSkimCreator,
+      /// but this is not true when running on Run2 data/MC already converted into AO2Ds.
+      auto bc = collision.template bc_as<aod::BCsWithTimestamps>();
+      if (runNumber != bc.runNumber()) {
+        LOG(info) << ">>>>>>>>>>>> Current run number: " << runNumber;
+        initCCDB(bc, runNumber, ccdb, isRun2 ? ccdbPathGrp : ccdbPathGrpMag, lut, isRun2);
+        bz = o2::base::Propagator::Instance()->getNominalBz();
+        LOG(info) << ">>>>>>>>>>>> Magnetic field: " << bz;
+      }
+      KFParticle::SetField(bz);
+
+//----------------------info of V0 and cascade tracks from LF-table------------------
+      std::array<float, 3> vertexV0 = {casc.xlambda(), casc.ylambda(), casc.zlambda()};
+      std::array<float, 3> pVecV0 = {casc.pxlambda(), casc.pylambda(), casc.pzlambda()};
+      std::array<float, 3> vertexCasc = {casc.x(), casc.y(), casc.z()};
+      std::array<float, 3> pVecCasc = {casc.px(), casc.py(), casc.pz()};
+
+      //----------------------Create XicPlus as KFParticle object-------------------------------------------
+      // initialize primary vertex
+      KFPVertex kfpVertex = createKFPVertexFromCollision(collision);
+      float covMatrixPV[6];
+      kfpVertex.GetCovarianceMatrix(covMatrixPV);
+      KFParticle kfPv(kfpVertex); // for calculation of DCAs to PV
+
+      // convert pion tracks into KFParticle object
+      KFPTrack kfpTrackCharmBachelor0 = createKFPTrackFromTrack(trackCharmBachelor0);
+      //  KFPTrack kfpTrackCharmBachelor1 = createKFPTrackFromTrack(trackCharmBachelor1);
+      KFParticle kfCharmBachelor0(kfpTrackCharmBachelor0, kPiPlus);
+      // KFParticle kfCharmBachelor1(kfpTrackCharmBachelor1, kPiPlus);
+
+      // create Xi as KFParticle object
+      // read {X,Y,Z,Px,Py,Pz} and corresponding covariance matrix from KF cascade Tables
+      constexpr std::size_t NElementsStateVector{6};
+      std::array<float, NElementsStateVector> xyzpxpypz = {casc.x(), casc.y(), casc.z(), casc.px(), casc.py(), casc.pz()};
+      float parPosMom[NElementsStateVector];
+      std::copy(xyzpxpypz.begin(), xyzpxpypz.end(), parPosMom);
+      // create KFParticle
+      KFParticle kfXi;
+      float massXi = casc.mXi();
+      kfXi.Create(parPosMom, casc.kfTrackCovMat(), casc.sign(), massXi);
+      if (useXiMassConstraint) {
+        kfXi.SetNonlinearMassConstraint(MassXiMinus);
+      }
+
+      // create XicZero as KFParticle object
+      KFParticle kfXicZero;
+      const KFParticle* kfDaughtersXicZero[2] = {&kfCharmBachelor0, &kfXi};
+      kfXicZero.SetConstructMethod(kfConstructMethod);
+      try {
+        kfXicZero.Construct(kfDaughtersXicZero, 2);
+      } catch (std::runtime_error& e) {
+        LOG(debug) << "Failed to construct XicZero : " << e.what();
+        continue;
+      }
+      if (fillHistograms) {
+        registry.fill(HIST("hCandCounter"), VertexFit);
+      }
+
+      // get geometrical chi2 of XicZero
+      float chi2GeoXicZero = kfXicZero.GetChi2() / kfXicZero.GetNDF();
+
+      // topological constraint of Xic to PV
+      float chi2topoXicZeroToPVBeforeConstraint = kfXicZero.GetDeviationFromVertex(kfPv);
+      KFParticle kfXicZeroToPV = kfXicZero;
+      kfXicZeroToPV.SetProductionVertex(kfPv);
+      float chi2topoXicZeroToPV = kfXicZeroToPV.GetChi2() / kfXicZeroToPV.GetNDF();
+      if (constrainXicZeroToPv) {
+        kfXicZero = kfXicZeroToPV;
+        kfXicZero.TransportToDecayVertex();
+      }
+
+      // topological constraint of Xi to XicZero
+      float chi2topoXiToXicZeroBeforeConstraint = kfXi.GetDeviationFromVertex(kfXicZero);
+      KFParticle kfXiToXicZero = kfXi;
+      kfXiToXicZero.SetProductionVertex(kfXicZero);
+      float chi2topoXiToXicZero = kfXiToXicZero.GetChi2() / kfXiToXicZero.GetNDF();
+      kfXiToXicZero.TransportToDecayVertex();
+      if (constrainXiToXicZero) {
+        KFParticle kfXicZeroWithXiToXicZero;
+        const KFParticle* kfDaughtersXicZeroWithXiToXicZero[2] = {&kfCharmBachelor0, &kfXiToXicZero};
+        kfXicZeroWithXiToXicZero.SetConstructMethod(kfConstructMethod);
+        try {
+          kfXicZeroWithXiToXicZero.Construct(kfDaughtersXicZeroWithXiToXicZero, 2);
+        } catch (std::runtime_error& e) {
+          LOG(debug) << "Failed to construct XicZero with Xi connstrained to XicZero: " << e.what();
+          continue;
+        }
+        kfXicZero = kfXicZeroWithXiToXicZero;
+      }
+
+      // get covariance matrix of XicZero
+      auto covMatrixXicZero = kfXicZero.CovarianceMatrix();
+
+      //---------------------calculate physical parameters of XicZero candidate----------------------
+      // sign of charm baryon
+      int signXic = casc.sign() < 0 ? +1 : -1;
+
+      // transport XicZero daughters to XicZero decay vertex (secondary vertex)
+      float secondaryVertex[3] = {0.};
+      secondaryVertex[0] = kfXicZero.GetX();
+      secondaryVertex[1] = kfXicZero.GetY();
+      secondaryVertex[2] = kfXicZero.GetZ();
+      kfXi.TransportToPoint(secondaryVertex);
+      kfCharmBachelor0.TransportToPoint(secondaryVertex);
+      // kfCharmBachelor1.TransportToPoint(secondaryVertex);
+
+      // get impact parameters of XicZero daughters
+      float impactParameterPi0XY = 0., errImpactParameterPi0XY = 0.;
+      //  float impactParameterPi1XY = 0., errImpactParameterPi1XY = 0.;
+      float impactParameterXiXY = 0., errImpactParameterXiXY = 0.;
+      kfCharmBachelor0.GetDistanceFromVertexXY(kfPv, impactParameterPi0XY, errImpactParameterPi0XY);
+      // kfCharmBachelor1.GetDistanceFromVertexXY(kfPv, impactParameterPi1XY, errImpactParameterPi1XY);
+      kfXi.GetDistanceFromVertexXY(kfPv, impactParameterXiXY, errImpactParameterXiXY);
+
+      // calculate cosine of pointing angle
+      std::array<float, 3> pvCoord = {collision.posX(), collision.posY(), collision.posZ()};
+      float cpaLambda = casc.v0cosPA(collision.posX(), collision.posY(), collision.posZ());
+      float cpaXYLambda = RecoDecay::cpaXY(pvCoord, vertexV0, pVecV0);
+      float cpaXi = casc.casccosPA(collision.posX(), collision.posY(), collision.posZ());
+      float cpaXYXi = RecoDecay::cpaXY(pvCoord, vertexCasc, pVecCasc);
+      float cpaLambdaToXi = RecoDecay::cpa(vertexCasc, vertexV0, pVecV0);
+      float cpaXYLambdaToXi = RecoDecay::cpaXY(vertexCasc, vertexV0, pVecV0);
+
+      // get DCAs of Pi0-Pi1, Pi0-Xi
+      // float dcaXYPi0Pi1 = kfCharmBachelor0.GetDistanceFromParticleXY(kfCharmBachelor1);
+      float dcaXYPi0Xi = kfCharmBachelor0.GetDistanceFromParticleXY(kfXi);
+      // float dcaXYPi1Xi = kfCharmBachelor1.GetDistanceFromParticleXY(kfXi);
+      // float dcaPi0Pi1 = kfCharmBachelor0.GetDistanceFromParticle(kfCharmBachelor1);
+      float dcaPi0Xi = kfCharmBachelor0.GetDistanceFromParticle(kfXi);
+      // float dcaPi1Xi = kfCharmBachelor1.GetDistanceFromParticle(kfXi);
+
+      // mass of Xi-Pi0 pair
+      KFParticle kfXiPi0;
+      float errMassXiPi0;
+      const KFParticle* kfXiResonanceDaughtersPi0[2] = {&kfXi, &kfCharmBachelor0};
+      kfXiPi0.SetConstructMethod(kfConstructMethod);
+      try {
+        kfXiPi0.Construct(kfXiResonanceDaughtersPi0, 2);
+      } catch (...) {
+        LOG(info) << "Failed to construct Xi(1530) with Pi 0";
+      }
+      kfXiPi0.GetMass(massXiPi0, errMassXiPi0);
+
+      // mass of Xi-Pi1 pair
+      // KFParticle kfXiPi1;
+      // float errMassXiPi1;
+      // const KFParticle* kfXiResonanceDaughtersPi1[2] = {&kfXi, &kfCharmBachelor1};
+      // kfXiPi1.SetConstructMethod(kfConstructMethod);
+      // try {
+      //   kfXiPi1.Construct(kfXiResonanceDaughtersPi1, 2);
+      // } catch (...) {
+      //   LOG(info) << "Failed to construct Xi(1530) with Pi 1";
+      // }
+      // kfXiPi1.GetMass(massXiPi1, errMassXiPi1);
+
+      // get invariant mass of Xic candidate
+      float errMassXiPi;
+      kfXicZero.GetMass(massXiPi, errMassXiPi);
+
+      // decay length of XicZero
+      // use XicZero constrained to PV (kfXicZeroToPV), since production point must be set before calling GetDecayLength(XY) on KFParticle
+      float kfDecayLength = 0., errorKfDecayLength = 0., kfDecayLengthXY = 0., errorKfDecayLengthXY = 0.;
+      kfXicZeroToPV.GetDecayLength(kfDecayLength, errorKfDecayLength);
+      kfXicZeroToPV.GetDecayLengthXY(kfDecayLengthXY, errorKfDecayLengthXY);
+      float kfDecayLengthNormalised = ldlFromKF(kfXicZero, kfPv);
+      float kfDecayLengthXYNormalised = ldlXYFromKF(kfXicZero, kfPv);
+
+      //--------------------- get PID information-----------------------
+      float nSigTpcPiFromXicZero0 = trackCharmBachelor0.tpcNSigmaPi();
+      float nSigTofPiFromXicZero0 = trackCharmBachelor0.tofNSigmaPi();
+      // float nSigTpcPiFromXicZero1 = trackCharmBachelor1.tpcNSigmaPi();
+      // float nSigTofPiFromXicZero1 = trackCharmBachelor1.tofNSigmaPi();
+      // Bachelor pion
+      auto trackPionFromXi = casc.bachelor_as<TracksWCovExtraPidPrPi>();
+      float nSigTpcBachelorPi = trackPionFromXi.tpcNSigmaPi();
+      float nSigTofBachelorPi = trackPionFromXi.tofNSigmaPi();
+      // Lambda daughters
+      auto trackPosLambdaDaughter = casc.posTrack_as<TracksWCovExtraPidPrPi>();
+      auto trackNegLambdaDaughter = casc.negTrack_as<TracksWCovExtraPidPrPi>();
+      float pPiFromLambda, pPrFromLambda, nSigTpcPiFromLambda, nSigTofPiFromLambda, nSigTpcPrFromLambda, nSigTofPrFromLambda;
+
+      if (signXic == +1) {
+        pPiFromLambda = trackNegLambdaDaughter.p();
+        nSigTpcPiFromLambda = trackNegLambdaDaughter.tpcNSigmaPi();
+        nSigTofPiFromLambda = trackNegLambdaDaughter.tofNSigmaPi();
+        pPrFromLambda = trackPosLambdaDaughter.p();
+        nSigTpcPrFromLambda = trackPosLambdaDaughter.tpcNSigmaPr();
+        nSigTofPrFromLambda = trackPosLambdaDaughter.tofNSigmaPr();
+      } else {
+        pPiFromLambda = trackPosLambdaDaughter.p();
+        nSigTpcPiFromLambda = trackPosLambdaDaughter.tpcNSigmaPi();
+        nSigTofPiFromLambda = trackPosLambdaDaughter.tofNSigmaPi();
+        pPrFromLambda = trackNegLambdaDaughter.p();
+        nSigTpcPrFromLambda = trackNegLambdaDaughter.tpcNSigmaPr();
+        nSigTofPrFromLambda = trackNegLambdaDaughter.tofNSigmaPr();
+      }
+
+      //-------------------------------fill histograms--------------------------------------------
+      if (fillHistograms) {
+        // invariant mass
+        registry.fill(HIST("hMass3"), massXiPi);
+        // covariance matrix elements of PV
+        registry.fill(HIST("hCovPVXX"), covMatrixPV[0]);
+        registry.fill(HIST("hCovPVYY"), covMatrixPV[2]);
+        registry.fill(HIST("hCovPVXZ"), covMatrixPV[3]);
+        registry.fill(HIST("hCovPVZZ"), covMatrixPV[5]);
+        // covariance matrix elements of SV
+        registry.fill(HIST("hCovSVXX"), covMatrixXicZero[0]);
+        registry.fill(HIST("hCovSVYY"), covMatrixXicZero[2]);
+        registry.fill(HIST("hCovSVXZ"), covMatrixXicZero[3]);
+        registry.fill(HIST("hCovSVZZ"), covMatrixXicZero[5]);
+        // DCAs of prongs
+        registry.fill(HIST("hDcaXYProngs"), kfXi.GetPt(), impactParameterXiXY);
+        registry.fill(HIST("hDcaXYProngs"), kfCharmBachelor0.GetPt(), impactParameterPi0XY);
+	// registry.fill(HIST("hDcaXYProngs"), kfCharmBachelor1.GetPt(), impactParameterPi1XY);
+      }
+
+      // set 3 prong variables to zero
+      float dummy = 0;
+      
+      //------------------------------fill candidate table rows--------------------------------------
+       rowCandidateBase(collision.globalIndex(),
+                       kfPv.GetX(), kfPv.GetY(), kfPv.GetZ(),
+                       std::sqrt(covMatrixPV[0]), std::sqrt(covMatrixPV[2]), std::sqrt(covMatrixPV[5]),
+                       /*3-prong specific columns*/
+                       rowTrackIndexXicZero.cascadeId(), rowTrackIndexXicZero.prong0Id(), dummy,
+                       casc.bachelorId(), casc.posTrackId(), casc.negTrackId(),
+                       secondaryVertex[0], secondaryVertex[1], secondaryVertex[2],
+                       kfXicZero.GetErrX(), kfXicZero.GetErrY(), kfXicZero.GetErrZ(),
+                       errorKfDecayLength, errorKfDecayLengthXY,
+                       chi2GeoXicZero, massXiPi, signXic,
+                       kfXi.GetPx(), kfXi.GetPy(), kfXi.GetPz(),
+                       kfCharmBachelor0.GetPx(), kfCharmBachelor0.GetPy(), kfCharmBachelor0.GetPz(),
+                       dummy, dummy, dummy,
+                       impactParameterXiXY, impactParameterPi0XY, dummy,
+                       errImpactParameterXiXY, errImpactParameterPi0XY, dummy,
+                       /*cascade specific columns*/
+                       trackPionFromXi.p(), pPiFromLambda, pPrFromLambda,
+                       cpaXi, cpaXYXi, cpaLambda, cpaXYLambda, cpaLambdaToXi, cpaXYLambdaToXi,
+                       massXi, casc.mLambda(), massXiPi0, dummy,
+                       /*DCA information*/
+                       casc.dcacascdaughters(), casc.dcaV0daughters(), casc.dcapostopv(), casc.dcanegtopv(), casc.dcabachtopv(),
+                       casc.dcaXYCascToPV(), casc.dcaZCascToPV(),
+                       /*PID information*/
+                       nSigTpcPiFromXicZero0, dummy, nSigTpcBachelorPi, nSigTpcPiFromLambda, nSigTpcPrFromLambda,
+                       nSigTofPiFromXicZero0, dummy, nSigTofBachelorPi, nSigTofPiFromLambda, nSigTofPrFromLambda);
+       rowCandidateKF(casc.kfCascadeChi2(), casc.kfV0Chi2(),
+                     kfDecayLength, kfDecayLengthNormalised, kfDecayLengthXY, kfDecayLengthXYNormalised,
+                     chi2topoXicZeroToPVBeforeConstraint, chi2topoXicZeroToPV, chi2topoXiToXicZeroBeforeConstraint, chi2topoXiToXicZero,
+                     dummy, dcaXYPi0Xi, dummy,
+                     dummy, dcaPi0Xi, dummy);
+      
+      
+   } // end for loop KFParticle Xic0
+
+
+
+   
+  } // end run KFParticle Xic0
+
+
+
+
+  
+  //==========
+  // PROCESS
+   //=========
+ ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+ // Process DCAFitter Selection for Xicp
+   //======================================================================
+  // 1 of 3
+  void processWithDCAFitterN(soa::Join<aod::Collisions, aod::EvSels> const& collisions, // adding centrality selection 
+				      aod::HfCascLf3Prongs const& rowsTrackIndexXicPlus,
+				      CascadesLinked const& traCascadeLinks,
+				      CascFull const& traCascades,
+				      TracksWCovDcaPidPrPi const& tracks,
+				      aod::BCsWithTimestamps const& bcWithTimeStamps)
+  {
+ 
+    {
+      //---------------
+      runCreatorWithDCAFitterN<o2::hf_centrality::CentralityEstimator::None>(collisions, rowsTrackIndexXicPlus, traCascadeLinks, traCascades, tracks, bcWithTimeStamps);
+    }
+    //---------------
+     
+  } // end process DCAFitter
+  PROCESS_SWITCH(HfCandidateCreatorXic0XicpToHadronic, processWithDCAFitterN, "Run candidate creator with DCAFitter.", true);
+  //======================================================================
+  // 2 of 3
+  void processWithDCAFitterNCentFT0C(soa::Join<aod::Collisions, aod::EvSels, aod::CentFT0Cs> const& collisions, // adding centrality selection 
+					      aod::HfCascLf3Prongs const& rowsTrackIndexXicPlus,
+					      CascadesLinked const& traCascadeLinks,
+					      CascFull const& traCascades,
+					      TracksWCovDcaPidPrPi const& tracks,
+					      aod::BCsWithTimestamps const& bcWithTimeStamps)
+  {
+ 
+    {
+      //---------------
+      runCreatorWithDCAFitterN<o2::hf_centrality::CentralityEstimator::FT0C>(collisions, rowsTrackIndexXicPlus, traCascadeLinks, traCascades, tracks, bcWithTimeStamps);
+    }
+    //---------------   
+  } // end process DCAFitter
+  PROCESS_SWITCH(HfCandidateCreatorXic0XicpToHadronic, processWithDCAFitterNCentFT0C, "Run candidate creator with DCAFitter.", false);
+  //======================================================================
+  // 3 of 3
+  void processWithDCAFitterNCentFT0M(soa::Join<aod::Collisions, aod::EvSels, aod::CentFT0Ms> const& collisions, // adding centrality selection 
+					      aod::HfCascLf3Prongs const& rowsTrackIndexXicPlus,
+					      CascadesLinked const& traCascadeLinks,
+					      CascFull const& traCascades,
+					      TracksWCovDcaPidPrPi const& tracks,
+					      aod::BCsWithTimestamps const& bcWithTimeStamps)
+  {
+
+    {
+      //---------------
+      runCreatorWithDCAFitterN<o2::hf_centrality::CentralityEstimator::FT0M>(collisions, rowsTrackIndexXicPlus, traCascadeLinks, traCascades, tracks, bcWithTimeStamps);
+    }
+    //---------------
+    
+  } // end process DCAFitter
+  PROCESS_SWITCH(HfCandidateCreatorXic0XicpToHadronic, processWithDCAFitterNCentFT0M, "Run candidate creator with DCAFitter.", false);
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+ 
+  // // Process KFParticle Selection for Xicp
+   //======================================================================
+  // 1 of 3
+  void processWithKFParticle(soa::Join<aod::Collisions, aod::EvSels> const& collisions,
+                                          aod::HfCascLf3Prongs const& rowsTrackIndexXicPlus,
+                                          KFCascadesLinked const& kfCascadesLinked,
+                                          KFCascFull const& kfCascadesFull,
+                                          TracksWCovExtraPidPrPi const& tracks,
+                                          aod::BCsWithTimestamps const& bcWithTimeStamps)
+  {
+    
+    {
+      //---------------
+      runCreatorWithKFParticle<o2::hf_centrality::CentralityEstimator::None>(collisions, rowsTrackIndexXicPlus,  kfCascadesLinked, kfCascadesFull, tracks, bcWithTimeStamps);
+    }
+    //---------------
+    
+  } // end process KFParticle
+  PROCESS_SWITCH(HfCandidateCreatorXic0XicpToHadronic, processWithKFParticle, "Run candidate creator with KFParticle using derived data from HfTrackIndexSkimCreatorLfCascades.", false);
+  //======================================================================
+  // 2 of 3
+  void processWithKFParticleCentFT0C(soa::Join<aod::Collisions, aod::EvSels, aod::CentFT0Cs> const& collisions,
+                                          aod::HfCascLf3Prongs const& rowsTrackIndexXicPlus,
+                                          KFCascadesLinked const& kfCascadesLinked,
+                                          KFCascFull const& kfCascadesFull,
+                                          TracksWCovExtraPidPrPi const& tracks,
+                                          aod::BCsWithTimestamps const& bcWithTimeStamps)
+  {
+
+    {
+      //---------------
+      runCreatorWithKFParticle<o2::hf_centrality::CentralityEstimator::FT0C>(collisions, rowsTrackIndexXicPlus, kfCascadesLinked, kfCascadesFull, tracks, bcWithTimeStamps);
+    }
+    //---------------
+    
+  } // end process KFParticle
+  PROCESS_SWITCH(HfCandidateCreatorXic0XicpToHadronic, processWithKFParticleCentFT0C, "Run candidate creator with KFParticle using derived data from HfTrackIndexSkimCreatorLfCascades.", false);
+   //======================================================================
+  // 3 of 3
+  void processWithKFParticleCentFT0M(soa::Join<aod::Collisions, aod::EvSels, aod::CentFT0Ms> const& collisions,
+                                          aod::HfCascLf3Prongs const& rowsTrackIndexXicPlus,
+                                          KFCascadesLinked const& kfCascadesLinked,
+                                          KFCascFull const& kfCascadesFull,
+                                          TracksWCovExtraPidPrPi const& tracks,
+                                          aod::BCsWithTimestamps const& bcWithTimeStamps)
+  {
+
+    {
+      //---------------
+      runCreatorWithKFParticle<o2::hf_centrality::CentralityEstimator::FT0M>(collisions, rowsTrackIndexXicPlus, kfCascadesLinked, kfCascadesFull, tracks, bcWithTimeStamps);
+    }
+    //---------------
+    
+  } // end process KFParticle
+  PROCESS_SWITCH(HfCandidateCreatorXic0XicpToHadronic, processWithKFParticleCentFT0M, "Run candidate creator with KFParticle using derived data from HfTrackIndexSkimCreatorLfCascades.", false);
+
+
+
+
+
+
+  
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+  // Process DCAFitter Selection for Xic0
+ //======================================================================
+ //1 of 3: 
+   void processWithDCAFitterNXic0(soa::Join<aod::Collisions, aod::EvSels> const& collisions, // adding centrality selection 
+				    aod::HfCascLf2Prongs const& rowsTrackIndexXicZero,
+				    CascadesLinked const& traCascadeLinks,
+				    CascFull const& traCascades,
+				    TracksWCovDcaPidPrPi const& tracks,
+				    aod::BCsWithTimestamps const& bcWithTimeStamps)
+  {
+ 
+     {
+      //---------------
+      runCreatorWithDCAFitterNXic0<CentralityEstimator::None>(collisions, rowsTrackIndexXicZero, traCascadeLinks, traCascades, tracks, bcWithTimeStamps);
+    }
+    //---------------
+     
+   } // end process DCAFitter
+  PROCESS_SWITCH(HfCandidateCreatorXic0XicpToHadronic, processWithDCAFitterNXic0, "Run candidate creator with DCAFitter.", false);
+//======================================================================
+ // 2 of 3: 
+   void processWithDCAFitterNCentFT0CXic0(soa::Join<aod::Collisions, aod::EvSels, aod::CentFT0Cs> const& collisions, // adding centrality selection 
+				    aod::HfCascLf2Prongs const& rowsTrackIndexXicZero,
+				    CascadesLinked const& traCascadeLinks,
+				    CascFull const& traCascades,
+				    TracksWCovDcaPidPrPi const& tracks,
+				    aod::BCsWithTimestamps const& bcWithTimeStamps)
+  {
+ 
+     {
+      //---------------
+      runCreatorWithDCAFitterNXic0<CentralityEstimator::FT0C>(collisions, rowsTrackIndexXicZero, traCascadeLinks, traCascades, tracks, bcWithTimeStamps);
+    }
+    //---------------
+     
+   } // end process DCAFitter
+  PROCESS_SWITCH(HfCandidateCreatorXic0XicpToHadronic,  processWithDCAFitterNCentFT0CXic0, "Run candidate creator with DCAFitter.", false);
+//======================================================================
+ // 3 of 3: 
+   void processWithDCAFitterNCentFT0MXic0(soa::Join<aod::Collisions, aod::EvSels, aod::CentFT0Ms> const& collisions, // adding centrality selection 
+				    aod::HfCascLf2Prongs const& rowsTrackIndexXicZero,
+				    CascadesLinked const& traCascadeLinks,
+				    CascFull const& traCascades,
+				    TracksWCovDcaPidPrPi const& tracks,
+				    aod::BCsWithTimestamps const& bcWithTimeStamps)
+  {
+
+     {
+      //---------------
+      runCreatorWithDCAFitterNXic0<CentralityEstimator::FT0M>(collisions, rowsTrackIndexXicZero, traCascadeLinks, traCascades, tracks, bcWithTimeStamps);
+    }
+    //---------------
+    
+   } // end process DCAFitter
+  PROCESS_SWITCH(HfCandidateCreatorXic0XicpToHadronic, processWithDCAFitterNCentFT0MXic0, "Run candidate creator with DCAFitter.", false);
+  ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+  // // Process KFParticle Selection for Xic0
+  //======================================================================
+  // 1 of 3: 
+  void processWithKFParticleXic0(soa::Join<aod::Collisions, aod::EvSels> const& collisions,
+                                          aod::HfCascLf2Prongs const& rowsTrackIndexXicZero,
+                                          KFCascadesLinked const& kfCascadesLinked,
+                                          KFCascFull const& kfCascadesFull,
+                                          TracksWCovExtraPidPrPi const& tracks,
+                                          aod::BCsWithTimestamps const& bcWithTimeStamps)
+  {
+
+    {
+      //---------------
+      runCreatorWithKFParticleXic0<CentralityEstimator::None>(collisions, rowsTrackIndexXicZero, kfCascadesLinked, kfCascadesFull, tracks, bcWithTimeStamps);
+    }
+    //---------------
+    
+  } // end process KFParticle
+  PROCESS_SWITCH(HfCandidateCreatorXic0XicpToHadronic, processWithKFParticleXic0, "Run candidate creator with KFParticle using derived data from HfTrackIndexSkimCreatorLfCascades.", false);
+  //======================================================================
+  // 2 of 3: 
+  void processWithKFParticleCentFT0CXic0(soa::Join<aod::Collisions, aod::EvSels, aod::CentFT0Cs> const& collisions,
+                                          aod::HfCascLf2Prongs const& rowsTrackIndexXicZero,
+                                          KFCascadesLinked const& kfCascadesLinked,
+                                          KFCascFull const& kfCascadesFull,
+                                          TracksWCovExtraPidPrPi const& tracks,
+                                          aod::BCsWithTimestamps const& bcWithTimeStamps)
+  {
+
+    {
+      //---------------
+      runCreatorWithKFParticleXic0<CentralityEstimator::FT0C>(collisions, rowsTrackIndexXicZero, kfCascadesLinked, kfCascadesFull, tracks, bcWithTimeStamps);
+    }
+    //---------------
+    
+  } // end process KFParticle
+  PROCESS_SWITCH(HfCandidateCreatorXic0XicpToHadronic, processWithKFParticleCentFT0CXic0, "Run candidate creator with KFParticle using derived data from HfTrackIndexSkimCreatorLfCascades.", false);
+  //======================================================================
+  // 3 of 3: 
+  void processWithKFParticleCentFT0MXic0(soa::Join<aod::Collisions, aod::EvSels, aod::CentFT0Ms> const& collisions,
+                                          aod::HfCascLf2Prongs const& rowsTrackIndexXicZero,
+                                          KFCascadesLinked const& kfCascadesLinked,
+                                          KFCascFull const& kfCascadesFull,
+                                          TracksWCovExtraPidPrPi const& tracks,
+                                          aod::BCsWithTimestamps const& bcWithTimeStamps)
+  {
+
+    {
+      //---------------
+      runCreatorWithKFParticleXic0<CentralityEstimator::FT0M>(collisions, rowsTrackIndexXicZero, kfCascadesLinked, kfCascadesFull, tracks, bcWithTimeStamps);
+    }
+    //---------------
+    
+  } // end process KFParticle
+  PROCESS_SWITCH(HfCandidateCreatorXic0XicpToHadronic, processWithKFParticleCentFT0MXic0, "Run candidate creator with KFParticle using derived data from HfTrackIndexSkimCreatorLfCascades.", false);
+
+
+
+
+
+
+
+
+
+
+  //======================
+  // PROCESS NO CENTRALITY
+   //=====================
+  //======================================================================
+  // process collisiosn - no centrality
+  void processCollisions(soa::Join<aod::Collisions,aod::EvSels>const& collisions,
+			 aod::BCsWithTimestamps const& /*bcWithTimeStamps*/)
+  {
+    /// loop over collisions
+    for (const auto& collision : collisions) {
+
+      //  bitmask with event. selection info
+      float centrality{-1.f};
+      float occupancy = getOccupancyColl(collision, OccupancyEstimator::Its);
+      // const auto rejectionMask = hfEvSel.getHfCollisionRejectionMask<true, CentralityEstimator::None, aod::BCsWithTimestamps>(collision, centrality, ccdb, registry);
+
+      //  // monitor the satisfied event selections
+      //  hfEvSel.fillHistograms(collision, rejectionMask, centrality, occupancy);
+
+    } /// end loop over collisions
+  }
+  PROCESS_SWITCH(HfCandidateCreatorXic0XicpToHadronic, processCollisions, "Collision monitoring - no centrality", true);
+  //======================================================================
+  // process collisiosn - FT0C centrality
+  /// @brief process function to monitor collisions - FT0C centrality
+  void processCollisionsCentFT0C(soa::Join<aod::Collisions,aod::EvSels,aod::CentFT0Cs> const& collisions,
+				 aod::BCsWithTimestamps const& /*bcWithTimeStamps*/)
+  {
+    // loop over collisions
+    for (const auto& collision : collisions) {
+
+      //  bitmask with event. selection info
+       float centrality{-1.f};
+        float occupancy = getOccupancyColl(collision, OccupancyEstimator::Its);
+	// const auto rejectionMask = hfEvSel.getHfCollisionRejectionMask<true, CentralityEstimator::FT0C, aod::BCsWithTimestamps>(collision, centrality, ccdb, registry);
+
+       //  monitor the satisfied event selections
+	//  hfEvSel.fillHistograms(collision, rejectionMask, centrality, occupancy);
+
+    } /// end loop over collisions
+  }
+  PROCESS_SWITCH(HfCandidateCreatorXic0XicpToHadronic, processCollisionsCentFT0C, "Collision monitoring - FT0C centrality", false);
+  //======================================================================
+  // process collisiosn - FT0M centrality
+  /// @brief process function to monitor collisions - FT0M centrality
+  void processCollisionsCentFT0M(soa::Join<aod::Collisions,aod::EvSels,aod::CentFT0Ms> const& collisions,
+				 aod::BCsWithTimestamps const& /*bcWithTimeStamps*/)
+  {
+    /// loop over collisions
+    for (const auto& collision : collisions) {
+
+      //  bitmask with event. selection info
+      float centrality{-1.f};
+       float occupancy = getOccupancyColl(collision, OccupancyEstimator::Its);
+      // const auto rejectionMask = hfEvSel.getHfCollisionRejectionMask<true, CentralityEstimator::FT0M, aod::BCsWithTimestamps>(collision, centrality, ccdb, registry);
+
+       //  monitor the satisfied event selections
+	//  hfEvSel.fillHistograms(collision, rejectionMask, centrality, occupancy);
+
+    } /// end loop over collisions
+  }
+  PROCESS_SWITCH(HfCandidateCreatorXic0XicpToHadronic, processCollisionsCentFT0M, "Collision monitoring - FT0M centrality", false);
+
+
+}; // end real data struct function
+
+
+
+
+
+
+
+
+
+
+
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/// Performs MC matching.
+struct HfCandidateCreatorXic0XicpToHadronicExpressions {
+  Spawns<aod::HfCandXicExt> rowCandidateXic;
+  Produces<aod::HfCandXicMcRec> rowMcMatchRec;
+  Produces<aod::HfCandXicMcGen> rowMcMatchGen;
+
+  Configurable<bool> fillMcHistograms{"fillMcHistograms", true, "Fill validation plots"};
+  Configurable<bool> matchDecayedPions{"matchDecayedPions", true, "Match also candidates with daughter pion tracks that decay with kinked topology"};
+  Configurable<bool> matchInteractionsWithMaterial{"matchInteractionsWithMaterial", true, "Match also candidates with daughter tracks that interact with material"};
+  Configurable<bool> rejectBackground{"rejectBackground", true, "Reject particles from background events"};
+
+  HfEventSelectionMc hfEvSelMc; 
+
+  // debug for Xic+
+  enum DebugRec { TotalRec = 0,
+                  XicToFinalState,
+                  XiToPiPPi,
+                  LambdaToPPi };
+
+  using McCollisionsNoCents = soa::Join<aod::Collisions, aod::EvSels, aod::McCollisionLabels>;
+  using McCollisionsFT0Cs = soa::Join<aod::Collisions, aod::EvSels, aod::McCollisionLabels, aod::CentFT0Cs>;
+  using McCollisionsFT0Ms = soa::Join<aod::Collisions, aod::EvSels, aod::McCollisionLabels, aod::CentFT0Ms>;
+  using McCollisionsCentFT0Ms = soa::Join<aod::McCollisions, aod::McCentFT0Ms>;
+  using BCsInfo = soa::Join<aod::BCs, aod::Timestamps, aod::BcSels>;
+  // using MyTracksWMc = soa::Join<TracksIU, McTrackLabels>;
+  
+  Preslice<aod::McParticles> mcParticlesPerMcCollision = aod::mcparticle::mcCollisionId;
+  PresliceUnsorted<McCollisionsNoCents> colPerMcCollision = aod::mccollisionlabel::mcCollisionId;
+  PresliceUnsorted<McCollisionsFT0Cs> colPerMcCollisionFT0C = aod::mccollisionlabel::mcCollisionId;
+  PresliceUnsorted<McCollisionsFT0Ms> colPerMcCollisionFT0M = aod::mccollisionlabel::mcCollisionId;
+
+  HistogramRegistry registry{"registry"};
+    
+  ///////////////////////////////////////////
+  void init(InitContext& initContext)
+  {
+
+    std::array<bool, 3> processXicp_MC = {doprocessMc, doprocessMcCentFT0C, doprocessMcCentFT0M};
+    const int nProcessXicp_MC = std::accumulate(processXicp_MC.begin(), processXicp_MC.end(), 0);
+    std::array<bool, 3> processXic0_MC = {doprocessMc_Xic0, doprocessMcCentFT0C_Xic0, doprocessMcCentFT0M_Xic0};
+    const int nProcessXic0_MC = std::accumulate(processXic0_MC.begin(), processXic0_MC.end(), 0);
+
+    if(nProcessXicp_MC > 1)
+      LOGP(fatal, "More than one MC process function has been enabled for Xicp analysis - please select one Xicp MC process function at a time");
+    if(nProcessXic0_MC > 1)
+      LOGP(fatal, "More than one MC process function has been enabled for Xic0 analysis - please select one Xic0 MC process function at a time");
+    // check that only Xic0 or Xicp MC analysis is enabled at a time
+    if( (nProcessXic0_MC >= 1) && (nProcessXicp_MC >= 1) )
+      LOGP(fatal, "Xic0 and Xicp MC process functions cannot both be enabled");
+
+  
+    // add histograms to registry for Xic+ 
+    if (fillMcHistograms)
+      {
+	registry.add("hDecayedPions", "hDecayedPions", {HistType::kTH1F, {{5, -0.5, 4.5}}});
+	registry.add("hInteractionsWithMaterial", "hInteractionsWithMaterial", {HistType::kTH1F, {{21, -0.5, 20.5}}});
+	registry.add("hDebugRec", "hDebugRec", {HistType::kTH1F, {{4, -0.5, 3.5}}});
+	registry.get<TH1>(HIST("hDebugRec"))->GetXaxis()->SetBinLabel(1 + TotalRec, "total");
+	// registry.get<TH1>(HIST("hDebugRec"))->GetXaxis()->SetBinLabel(1 + XicToFinalState, "#Xi^{+}_{c} #rightarrow #pi^{#plus}) #pi^{#plus} #pi^{#minus} p #pi^{#minus}");
+	registry.get<TH1>(HIST("hDebugRec"))->GetXaxis()->SetBinLabel(1 + XiToPiPPi, "#Xi^{#minus} #rightarrow #pi^{#minus} p #pi^{#minus}");
+	registry.get<TH1>(HIST("hDebugRec"))->GetXaxis()->SetBinLabel(1 + LambdaToPPi, "#Lambda #rightarrow p #pi^{#minus}");
+      }
+    
+    // initialize HF event selection helper
+    const auto& workflows = initContext.services().get<RunningWorkflowInfo const>();
+    for (const DeviceSpec& device : workflows.devices)
+      {
+	if (device.name.compare("hf-candidate-creator-xic0-xicp-to-hadronic") == 0)
+	  {
+	    hfEvSelMc.init(device, registry);
+	    break;
+	  }
+      }
+    
+  } // end init
+
+
+  ////////////////////////  run Xicp MC
+  /////////////////////////
+   template <o2::hf_centrality::CentralityEstimator centEstimator, typename McCollisions, typename CollInfos>
+   void runMcMatching(aod::TracksWMc const& tracks,
+                     aod::McParticles const& mcParticles,
+                     McCollisions const& mcCollisions,
+                     CollInfos const& collInfos,
+                     BCsInfo const&)
+  {
+
+    rowCandidateXic->bindExternalIndices(&tracks);
+     registry.get<TH1>(HIST("hDebugRec"))->GetXaxis()->SetBinLabel(1 + XicToFinalState, "#Xi^{+}_{c} #rightarrow #pi^{#plus}) #pi^{#plus} #pi^{#minus} p #pi^{#minus}");
+
+    int indexRec = -1;
+    int indexRecXicPlus = -1;
+    int8_t sign = 0;
+    int8_t flag = 0;
+    int8_t origin = RecoDecay::OriginType::None;
+    int8_t nPionsDecayed = 0;
+    int8_t nInteractionsWithMaterial = 0;
+    // More on RecoDecay:   https://github.com/AliceO2Group/O2Physics/blob/master/Common/Core/RecoDecay.h
+
+    // for resonance matching
+    std::vector<int> arrDaughIndex;
+    constexpr std::size_t NDaughtersResonant{2u};
+    std::array<int, NDaughtersResonant> arrPDGDaugh;
+    std::array<int, NDaughtersResonant> arrXiResonance = {3324, kPiPlus}; // 3324: Ξ(1530)
+    // for non-prompt
+    std::vector<int> idxBhadMothers;
+
+    // Match reconstructed candidates.
+    for (const auto& candidate : *rowCandidateXic)
+      {
+	sign = 0;
+	flag = 0;
+	origin = RecoDecay::OriginType::None;
+	nPionsDecayed = 0;
+	nInteractionsWithMaterial = 0;
+	arrDaughIndex.clear();
+
+	auto arrayDaughters = std::array{candidate.pi0_as<aod::TracksWMc>(),       // pi <- Xic
+					 candidate.pi1_as<aod::TracksWMc>(),       // pi <- Xic
+					 candidate.bachelor_as<aod::TracksWMc>(),  // pi <- cascade
+					 candidate.posTrack_as<aod::TracksWMc>(),  // p <- lambda
+					 candidate.negTrack_as<aod::TracksWMc>()}; // pi <- lambda
+	auto arrayDaughtersCasc = std::array{candidate.bachelor_as<aod::TracksWMc>(),
+					     candidate.posTrack_as<aod::TracksWMc>(),
+					     candidate.negTrack_as<aod::TracksWMc>()};
+	auto arrayDaughtersV0 = std::array{candidate.posTrack_as<aod::TracksWMc>(),
+					   candidate.negTrack_as<aod::TracksWMc>()};
+	
+	if (fillMcHistograms)
+	  {
+	    registry.fill(HIST("hDebugRec"), TotalRec);
+	  }
+
+	// 1. Xic → pi pi pi pi p
+	if (matchDecayedPions && matchInteractionsWithMaterial)
+	  {
+	    indexRec = RecoDecay::getMatchedMCRec<false, true, false, true, true>(mcParticles, arrayDaughters, Pdg::kXiCPlus, std::array{+kPiPlus, +kPiPlus, +kPiMinus, +kProton, +kPiMinus}, true, &sign, 4, &nPionsDecayed, nullptr, &nInteractionsWithMaterial);
+	  
+	  }
+	else if (matchDecayedPions && !matchInteractionsWithMaterial)
+	  {
+	    indexRec = RecoDecay::getMatchedMCRec<false, true, false, true, false>(mcParticles, arrayDaughters, Pdg::kXiCPlus, std::array{+kPiPlus, +kPiPlus, +kPiMinus, +kProton, +kPiMinus}, true, &sign, 4, &nPionsDecayed, nullptr, &nInteractionsWithMaterial);
+	  }
+	
+	else if (!matchDecayedPions && matchInteractionsWithMaterial)
+	  {
+	    indexRec = RecoDecay::getMatchedMCRec<false, true, false, false, true>(mcParticles, arrayDaughters, Pdg::kXiCPlus, std::array{+kPiPlus, +kPiPlus, +kPiMinus, +kProton, +kPiMinus}, true, &sign, 4, &nPionsDecayed, nullptr, &nInteractionsWithMaterial);
+	  
+	  }
+	else
+	  {
+	    indexRec = RecoDecay::getMatchedMCRec<false, true, false, false, false>(mcParticles, arrayDaughters, Pdg::kXiCPlus, std::array{+kPiPlus, +kPiPlus, +kPiMinus, +kProton, +kPiMinus}, true, &sign, 4, &nPionsDecayed, nullptr, &nInteractionsWithMaterial);
+	  }
+	
+	indexRecXicPlus = indexRec;
+	
+	if (indexRec > -1)
+	  {
+	    if (fillMcHistograms)
+	      {
+		registry.fill(HIST("hDebugRec"), XicToFinalState);
+	      }
+	    // 2. Xi- → pi pi p
+	    if (matchDecayedPions && matchInteractionsWithMaterial)
+	      {
+		indexRec = RecoDecay::getMatchedMCRec<false, true, false, true, true>(mcParticles, arrayDaughtersCasc, +kXiMinus, std::array{+kPiMinus, +kProton, +kPiMinus}, true, nullptr, 2);
+	      }
+	    else if (matchDecayedPions && !matchInteractionsWithMaterial)
+	      {
+		indexRec = RecoDecay::getMatchedMCRec<false, true, false, true, false>(mcParticles, arrayDaughtersCasc, +kXiMinus, std::array{+kPiMinus, +kProton, +kPiMinus}, true, nullptr, 2);
+	      }
+	    else if (!matchDecayedPions && matchInteractionsWithMaterial)
+	      {
+		indexRec = RecoDecay::getMatchedMCRec<false, true, false, false, true>(mcParticles, arrayDaughtersCasc, +kXiMinus, std::array{+kPiMinus, +kProton, +kPiMinus}, true, nullptr, 2);
+	      }
+	    else
+	      {
+		indexRec = RecoDecay::getMatchedMCRec<false, true, false, false, false>(mcParticles, arrayDaughtersCasc, +kXiMinus, std::array{+kPiMinus, +kProton, +kPiMinus}, true, nullptr, 2);
+	      }
+	    if (indexRec > -1)
+	      {
+		if (fillMcHistograms)
+		  {
+		    registry.fill(HIST("hDebugRec"), XiToPiPPi);
+		  }
+		//3.  Lambda → p pi
+		if (matchDecayedPions && matchInteractionsWithMaterial)
+		  {
+		    indexRec = RecoDecay::getMatchedMCRec<false, true, false, true, true>(mcParticles, arrayDaughtersV0, +kLambda0, std::array{+kProton, +kPiMinus}, true);
+		  }
+		else if (matchDecayedPions && !matchInteractionsWithMaterial)
+		  {
+		    indexRec = RecoDecay::getMatchedMCRec<false, true, false, true, false>(mcParticles, arrayDaughtersV0, +kLambda0, std::array{+kProton, +kPiMinus}, true);
+		  }
+		else if (!matchDecayedPions && matchInteractionsWithMaterial)
+		  {
+		    indexRec = RecoDecay::getMatchedMCRec<false, true, false, false, true>(mcParticles, arrayDaughtersV0, +kLambda0, std::array{+kProton, +kPiMinus}, true);
+		  }
+		else
+		  {
+		    indexRec = RecoDecay::getMatchedMCRec<false, true, false, false, false>(mcParticles, arrayDaughtersV0, +kLambda0, std::array{+kProton, +kPiMinus}, true);
+		  }
+		if (indexRec > -1)
+		  {
+		    if (fillMcHistograms)
+		      {
+			registry.fill(HIST("hDebugRec"), LambdaToPPi);
+		      }
+		    RecoDecay::getDaughters(mcParticles.rawIteratorAt(indexRecXicPlus), &arrDaughIndex, std::array{0}, 1);
+		    if (arrDaughIndex.size() == NDaughtersResonant)
+		      {
+			for (auto iProng = 0u; iProng < NDaughtersResonant; ++iProng)
+			  {
+			    auto daughI = mcParticles.rawIteratorAt(arrDaughIndex[iProng]);
+			    arrPDGDaugh[iProng] = std::abs(daughI.pdgCode());
+			  }
+			if ((arrPDGDaugh[0] == arrXiResonance[0] && arrPDGDaugh[1] == arrXiResonance[1]) || (arrPDGDaugh[0] == arrXiResonance[1] && arrPDGDaugh[1] == arrXiResonance[0])) {
+			  flag = sign * (1 << aod::hf_cand_xic_to_xi_pi_pi::DecayType::XicToXiResPiToXiPiPi);
+			}
+		      }
+		    else
+		      {
+			flag = sign * (1 << aod::hf_cand_xic_to_xi_pi_pi::DecayType::XicToXiPiPi);
+		      }
+		  }
+	      }
+	  }
+
+	// Check whether the charm baryon is non-prompt (from a b quark).
+	if (flag != 0)
+	  {
+	    auto particle = mcParticles.rawIteratorAt(indexRecXicPlus);
+	    origin = RecoDecay::getCharmHadronOrigin(mcParticles, particle, false);
+	  }
+	// Fill histograms
+	if (flag != 0 && fillMcHistograms)
+	  {
+	    registry.fill(HIST("hDecayedPions"), nPionsDecayed);
+	    registry.fill(HIST("hInteractionsWithMaterial"), nInteractionsWithMaterial);
+	  }
+	// Fill table
+	rowMcMatchRec(flag, origin);
+      } // close loop over candidates
+
+    // Match generated particles.
+    for (const auto& mcCollision : mcCollisions)
+      {
+	// Slice the particles table to get the particles for the current MC collision
+	const auto mcParticlesPerMcColl = mcParticles.sliceBy(mcParticlesPerMcCollision, mcCollision.globalIndex());
+	// Slice the collisions table to get the collision info for the current MC collision
+	float centrality{-1.f};
+	uint16_t rejectionMask{0};
+	int nSplitColl = 0;
+	
+	if constexpr (centEstimator == o2::hf_centrality::CentralityEstimator::FT0C)
+		       {
+			 const auto collSlice = collInfos.sliceBy(colPerMcCollisionFT0C, mcCollision.globalIndex());
+			 rejectionMask = hfEvSelMc.getHfMcCollisionRejectionMask<BCsInfo, centEstimator>(mcCollision, collSlice, centrality);
+		       }
+	else if constexpr (centEstimator == o2::hf_centrality::CentralityEstimator::FT0M)
+			    {
+			      const auto collSlice = collInfos.sliceBy(colPerMcCollisionFT0M, mcCollision.globalIndex());
+			      nSplitColl = collSlice.size();
+			      rejectionMask = hfEvSelMc.getHfMcCollisionRejectionMask<BCsInfo, centEstimator>(mcCollision, collSlice, centrality);
+			    }
+	else if constexpr (centEstimator == o2::hf_centrality::CentralityEstimator::None)
+			    {
+			      const auto collSlice = collInfos.sliceBy(colPerMcCollision, mcCollision.globalIndex());
+			      rejectionMask = hfEvSelMc.getHfMcCollisionRejectionMask<BCsInfo, centEstimator>(mcCollision, collSlice, centrality);
+			    }
+	
+	hfEvSelMc.fillHistograms<centEstimator>(mcCollision, rejectionMask, nSplitColl);
+	
+	if (rejectionMask != 0)
+	  {
+	    // at least one event selection not satisfied --> reject all particles from this collision
+	    for (unsigned int i = 0; i < mcParticlesPerMcColl.size(); ++i)
+	      {
+		rowMcMatchGen(-99, -99, -99);
+	      }
+	    continue;
+	  }
+
+	for (const auto& particle : mcParticlesPerMcColl) {
+	  sign = 0;
+	  flag = 0;
+	  origin = RecoDecay::OriginType::None;
+	  arrDaughIndex.clear();
+	  idxBhadMothers.clear();
+
+	  // 4. Xic → Xi pi pi
+	  if (RecoDecay::isMatchedMCGen<false, true>(mcParticles, particle, Pdg::kXiCPlus, std::array{+kXiMinus, +kPiPlus, +kPiPlus}, true, &sign, 2))
+	    {
+	      // 5. Xi- -> Lambda pi
+	      auto cascMC = mcParticles.rawIteratorAt(particle.daughtersIds().front());
+	      // 6. Find Xi- from Xi(1530) -> Xi pi in case of resonant decay
+	      RecoDecay::getDaughters(particle, &arrDaughIndex, std::array{0}, 1);
+	      if (arrDaughIndex.size() == NDaughtersResonant)
+		{
+		  auto cascStarMC = mcParticles.rawIteratorAt(particle.daughtersIds().front());
+		  if (RecoDecay::isMatchedMCGen<false, true>(mcParticles, cascStarMC, +3324, std::array{+kXiMinus, +kPiPlus}, true))
+		    {
+		      cascMC = mcParticles.rawIteratorAt(cascStarMC.daughtersIds().front());
+		    }
+		}
+	      if (RecoDecay::isMatchedMCGen<false, true>(mcParticles, cascMC, +kXiMinus, std::array{+kLambda0, +kPiMinus}, true))
+		{
+		  // 7. Lambda -> p pi
+		  auto v0MC = mcParticles.rawIteratorAt(cascMC.daughtersIds().front());
+		  if (RecoDecay::isMatchedMCGen<false, true>(mcParticles, v0MC, +kLambda0, std::array{+kProton, +kPiMinus}, true))
+		    {
+		      if (arrDaughIndex.size() == NDaughtersResonant)
+			{
+			  for (auto iProng = 0u; iProng < NDaughtersResonant; ++iProng)
+			    {
+			      auto daughI = mcParticles.rawIteratorAt(arrDaughIndex[iProng]);
+			      arrPDGDaugh[iProng] = std::abs(daughI.pdgCode());
+			    }
+			  if ((arrPDGDaugh[0] == arrXiResonance[0] && arrPDGDaugh[1] == arrXiResonance[1]) || (arrPDGDaugh[0] == arrXiResonance[1] && arrPDGDaugh[1] == arrXiResonance[0])) {
+			    flag = sign * (1 << aod::hf_cand_xic_to_xi_pi_pi::DecayType::XicToXiResPiToXiPiPi);
+			  }
+			}
+		      else
+			{
+			  flag = sign * (1 << aod::hf_cand_xic_to_xi_pi_pi::DecayType::XicToXiPiPi);
+			}
+		    }
+		}
+	    }
+
+	  // 8. Check whether the charm baryon is non-prompt (from a b quark).
+	  if (flag != 0)
+	    {
+	      origin = RecoDecay::getCharmHadronOrigin(mcParticles, particle, false, &idxBhadMothers);
+	    }
+	  // Fill table
+	  if (origin == RecoDecay::OriginType::NonPrompt)
+	    {
+	      auto bHadMother = mcParticles.rawIteratorAt(idxBhadMothers[0]);
+	      rowMcMatchGen(flag, origin, bHadMother.pdgCode());
+	      
+	    }
+	  else
+	    {
+	      rowMcMatchGen(flag, origin, 0);
+	    }
+	} // end for loop generated particles
+	
+      } // end for loop McCollisions
+    
+    
+  } // end run function MC Xicp
+
+
+  
+     
+  ////////////////////////  run Xic0 MC
+  /////////////////////////
+ template <o2::hf_centrality::CentralityEstimator centEstimator, typename McCollisions, typename CollInfos>
+   void runMcMatchingXic0(aod::TracksWMc const& tracks,
+                     aod::McParticles const& mcParticles,
+                     McCollisions const& mcCollisions,
+                     CollInfos const& collInfos,
+                     BCsInfo const&)
+  {
+
+    rowCandidateXic->bindExternalIndices(&tracks);
+    registry.get<TH1>(HIST("hDebugRec"))->GetXaxis()->SetBinLabel(1 + XicToFinalState, "#Xi^{0}_{c} #rightarrow #pi^{#plus}) #pi^{#minus} p #pi^{#minus}");
+
+    int indexRec = -1;
+    int indexRecXicZero = -1;
+    int8_t sign = 0;
+    int8_t flag = 0;
+    int8_t origin = RecoDecay::OriginType::None;
+    int8_t nPionsDecayed = 0;
+    int8_t nInteractionsWithMaterial = 0;
+    // More on RecoDecay:   https://github.com/AliceO2Group/O2Physics/blob/master/Common/Core/RecoDecay.h
+
+    // for resonance matching
+    std::vector<int> arrDaughIndex;
+    constexpr std::size_t NDaughtersResonant{2u};
+    std::array<int, NDaughtersResonant> arrPDGDaugh;
+    std::array<int, NDaughtersResonant> arrXiResonance = {3324, kPiPlus}; // 3324: Ξ(1530)
+    // for non-prompt
+    std::vector<int> idxBhadMothers;
+
+    // Match reconstructed candidates.
+    for (const auto& candidate : *rowCandidateXic)
+      {
+	sign = 0;
+	flag = 0;
+	origin = RecoDecay::OriginType::None;
+	nPionsDecayed = 0;
+	nInteractionsWithMaterial = 0;
+	arrDaughIndex.clear();
+
+	auto arrayDaughters = std::array{candidate.pi0_as<aod::TracksWMc>(),       // pi <- Xic0
+					 //candidate.pi1_as<aod::TracksWMc>(),       // pi <- Xic
+					 candidate.bachelor_as<aod::TracksWMc>(),  // pi <- cascade
+					 candidate.posTrack_as<aod::TracksWMc>(),  // p <- lambda
+					 candidate.negTrack_as<aod::TracksWMc>()}; // pi <- lambda
+	auto arrayDaughtersCasc = std::array{candidate.bachelor_as<aod::TracksWMc>(),
+					     candidate.posTrack_as<aod::TracksWMc>(),
+					     candidate.negTrack_as<aod::TracksWMc>()};
+	auto arrayDaughtersV0 = std::array{candidate.posTrack_as<aod::TracksWMc>(),
+					   candidate.negTrack_as<aod::TracksWMc>()};
+
+	if (fillMcHistograms)
+	  {
+	    registry.fill(HIST("hDebugRec"), TotalRec);
+	  }
+	
+	// 1. Xic0 → pi pi pi p
+	if (matchDecayedPions && matchInteractionsWithMaterial)
+	  {
+	    indexRec = RecoDecay::getMatchedMCRec<false, true, false, true, true>(mcParticles, arrayDaughters, Pdg::kXiC0, std::array{+kPiPlus, +kPiMinus, +kProton, +kPiMinus}, true, &sign, 3, &nPionsDecayed, nullptr, &nInteractionsWithMaterial);
+	  }
+	else if (matchDecayedPions && !matchInteractionsWithMaterial)
+	  {
+	    indexRec = RecoDecay::getMatchedMCRec<false, true, false, true, false>(mcParticles, arrayDaughters, Pdg::kXiC0, std::array{+kPiPlus, +kPiMinus, +kProton, +kPiMinus}, true, &sign, 3, &nPionsDecayed, nullptr, &nInteractionsWithMaterial);
+	  }
+	else if (!matchDecayedPions && matchInteractionsWithMaterial)
+	  {
+	    indexRec = RecoDecay::getMatchedMCRec<false, true, false, false, true>(mcParticles, arrayDaughters, Pdg::kXiC0, std::array{+kPiPlus, +kPiMinus, +kProton, +kPiMinus}, true, &sign, 3, &nPionsDecayed, nullptr, &nInteractionsWithMaterial);
+	  }
+	else
+	  {
+	    indexRec = RecoDecay::getMatchedMCRec<false, true, false, false, false>(mcParticles, arrayDaughters, Pdg::kXiC0, std::array{+kPiPlus, +kPiMinus, +kProton, +kPiMinus}, true, &sign, 3, &nPionsDecayed, nullptr, &nInteractionsWithMaterial);
+	  }
+	
+	indexRecXicZero = indexRec;
+	
+	if (indexRec > -1) {
+	  if (fillMcHistograms) {
+	    registry.fill(HIST("hDebugRec"), XicToFinalState);
+	  }
+	  // 2. Xi- → pi pi p
+	  if (matchDecayedPions && matchInteractionsWithMaterial) {
+	    indexRec = RecoDecay::getMatchedMCRec<false, true, false, true, true>(mcParticles, arrayDaughtersCasc, +kXiMinus, std::array{+kPiMinus, +kProton, +kPiMinus}, true, nullptr, 2);
+	  } else if (matchDecayedPions && !matchInteractionsWithMaterial) {
+	    indexRec = RecoDecay::getMatchedMCRec<false, true, false, true, false>(mcParticles, arrayDaughtersCasc, +kXiMinus, std::array{+kPiMinus, +kProton, +kPiMinus}, true, nullptr, 2);
+	  } else if (!matchDecayedPions && matchInteractionsWithMaterial) {
+	    indexRec = RecoDecay::getMatchedMCRec<false, true, false, false, true>(mcParticles, arrayDaughtersCasc, +kXiMinus, std::array{+kPiMinus, +kProton, +kPiMinus}, true, nullptr, 2);
+	  } else {
+	    indexRec = RecoDecay::getMatchedMCRec<false, true, false, false, false>(mcParticles, arrayDaughtersCasc, +kXiMinus, std::array{+kPiMinus, +kProton, +kPiMinus}, true, nullptr, 2);
+	  }
+	  if (indexRec > -1) {
+	    if (fillMcHistograms) {
+	      registry.fill(HIST("hDebugRec"), XiToPiPPi);
+	    }
+	    // 3. Lambda → p pi
+	    if (matchDecayedPions && matchInteractionsWithMaterial) {
+	      indexRec = RecoDecay::getMatchedMCRec<false, true, false, true, true>(mcParticles, arrayDaughtersV0, +kLambda0, std::array{+kProton, +kPiMinus}, true);
+	    } else if (matchDecayedPions && !matchInteractionsWithMaterial) {
+	      indexRec = RecoDecay::getMatchedMCRec<false, true, false, true, false>(mcParticles, arrayDaughtersV0, +kLambda0, std::array{+kProton, +kPiMinus}, true);
+	    } else if (!matchDecayedPions && matchInteractionsWithMaterial) {
+	      indexRec = RecoDecay::getMatchedMCRec<false, true, false, false, true>(mcParticles, arrayDaughtersV0, +kLambda0, std::array{+kProton, +kPiMinus}, true);
+	    } else {
+	      indexRec = RecoDecay::getMatchedMCRec<false, true, false, false, false>(mcParticles, arrayDaughtersV0, +kLambda0, std::array{+kProton, +kPiMinus}, true);
+	    }
+	    if (indexRec > -1) {
+	      if (fillMcHistograms) {
+		registry.fill(HIST("hDebugRec"), LambdaToPPi);
+	      }
+	      RecoDecay::getDaughters(mcParticles.rawIteratorAt(indexRecXicZero), &arrDaughIndex, std::array{0}, 1);
+	      if (arrDaughIndex.size() == NDaughtersResonant) {
+		for (auto iProng = 0u; iProng < NDaughtersResonant; ++iProng) {
+		  auto daughI = mcParticles.rawIteratorAt(arrDaughIndex[iProng]);
+		  arrPDGDaugh[iProng] = std::abs(daughI.pdgCode());
+		}
+		if ((arrPDGDaugh[0] == arrXiResonance[0] && arrPDGDaugh[1] == arrXiResonance[1]) || (arrPDGDaugh[0] == arrXiResonance[1] && arrPDGDaugh[1] == arrXiResonance[0])) {
+		  flag = sign * (1 << aod::hf_cand_xic0_omegac0::DecayType::XiczeroToXiPi);
+		}
+	      } else {
+		flag = sign * (1 << aod::hf_cand_xic0_omegac0::DecayType::XiczeroToXiPi);
+	      }
+	    }
+	  }
+	}
+	// Check whether the charm baryon is non-prompt (from a b quark).
+	if (flag != 0) {
+	  auto particle = mcParticles.rawIteratorAt(indexRecXicZero);
+	  origin = RecoDecay::getCharmHadronOrigin(mcParticles, particle, false);
+	}
+	// Fill histograms
+	if (flag != 0 && fillMcHistograms) {
+	  registry.fill(HIST("hDecayedPions"), nPionsDecayed);
+	  registry.fill(HIST("hInteractionsWithMaterial"), nInteractionsWithMaterial);
+	}
+	// Fill table
+	rowMcMatchRec(flag, origin);
+      
+      } // end for loop candidates
+
+    // Match generated particles.
+    for (const auto& mcCollision : mcCollisions) {
+      // Slice the particles table to get the particles for the current MC collision
+      const auto mcParticlesPerMcColl = mcParticles.sliceBy(mcParticlesPerMcCollision, mcCollision.globalIndex());
+      // Slice the collisions table to get the collision info for the current MC collision
+      float centrality{-1.f};
+      uint16_t rejectionMask{0};
+      int nSplitColl = 0;
+      if constexpr (centEstimator == o2::hf_centrality::CentralityEstimator::FT0C) {
+        const auto collSlice = collInfos.sliceBy(colPerMcCollisionFT0C, mcCollision.globalIndex());
+        rejectionMask = hfEvSelMc.getHfMcCollisionRejectionMask<BCsInfo, centEstimator>(mcCollision, collSlice, centrality);
+      } else if constexpr (centEstimator == o2::hf_centrality::CentralityEstimator::FT0M) {
+        const auto collSlice = collInfos.sliceBy(colPerMcCollisionFT0M, mcCollision.globalIndex());
+        nSplitColl = collSlice.size();
+        rejectionMask = hfEvSelMc.getHfMcCollisionRejectionMask<BCsInfo, centEstimator>(mcCollision, collSlice, centrality);
+      } else if constexpr (centEstimator == o2::hf_centrality::CentralityEstimator::None) {
+        const auto collSlice = collInfos.sliceBy(colPerMcCollision, mcCollision.globalIndex());
+        rejectionMask = hfEvSelMc.getHfMcCollisionRejectionMask<BCsInfo, centEstimator>(mcCollision, collSlice, centrality);
+      }
+      hfEvSelMc.fillHistograms<centEstimator>(mcCollision, rejectionMask, nSplitColl);
+      if (rejectionMask != 0) {
+        // at least one event selection not satisfied --> reject all particles from this collision
+        for (unsigned int i = 0; i < mcParticlesPerMcColl.size(); ++i) {
+          rowMcMatchGen(-99, -99, -99);
+        }
+        continue;
+      }
+
+      for (const auto& particle : mcParticlesPerMcColl) {
+        sign = 0;
+        flag = 0;
+        origin = RecoDecay::OriginType::None;
+        arrDaughIndex.clear();
+        idxBhadMothers.clear();
+
+	//  1. Xic → Xi pi pi
+        if (RecoDecay::isMatchedMCGen<false, true>(mcParticles, particle, Pdg::kXiC0, std::array{+kXiMinus, +kPiPlus}, true, &sign, 2)) {
+          // 2. Xi- -> Lambda pi
+          auto cascMC = mcParticles.rawIteratorAt(particle.daughtersIds().front());
+          //3.  Find Xi- from Xi(1530) -> Xi pi in case of resonant decay
+          RecoDecay::getDaughters(particle, &arrDaughIndex, std::array{0}, 1);
+          if (arrDaughIndex.size() == NDaughtersResonant) {
+            auto cascStarMC = mcParticles.rawIteratorAt(particle.daughtersIds().front());
+            if (RecoDecay::isMatchedMCGen<false, true>(mcParticles, cascStarMC, +3324, std::array{+kXiMinus, +kPiPlus}, true)) {
+              cascMC = mcParticles.rawIteratorAt(cascStarMC.daughtersIds().front());
+            }
+          }
+          if (RecoDecay::isMatchedMCGen<false, true>(mcParticles, cascMC, +kXiMinus, std::array{+kLambda0, +kPiMinus}, true)) {
+            // 4. Lambda -> p pi
+            auto v0MC = mcParticles.rawIteratorAt(cascMC.daughtersIds().front());
+            if (RecoDecay::isMatchedMCGen<false, true>(mcParticles, v0MC, +kLambda0, std::array{+kProton, +kPiMinus}, true)) {
+              if (arrDaughIndex.size() == NDaughtersResonant) {
+                for (auto iProng = 0u; iProng < NDaughtersResonant; ++iProng) {
+                  auto daughI = mcParticles.rawIteratorAt(arrDaughIndex[iProng]);
+                  arrPDGDaugh[iProng] = std::abs(daughI.pdgCode());
+                }
+                if ((arrPDGDaugh[0] == arrXiResonance[0] && arrPDGDaugh[1] == arrXiResonance[1]) || (arrPDGDaugh[0] == arrXiResonance[1] && arrPDGDaugh[1] == arrXiResonance[0])) {
+                  flag = sign * (1 << aod::hf_cand_xic0_omegac0::DecayType::XiczeroToXiPi);
+                }
+              } else {
+                flag = sign * (1 << aod::hf_cand_xic0_omegac0::DecayType::XiczeroToXiPi);
+              }
+            }
+          }
+        }
+
+
+	// Check whether the charm baryon is non-prompt (from a b quark).
+        if (flag != 0) {
+          origin = RecoDecay::getCharmHadronOrigin(mcParticles, particle, false, &idxBhadMothers);
+        }
+        // Fill table
+        if (origin == RecoDecay::OriginType::NonPrompt) {
+          auto bHadMother = mcParticles.rawIteratorAt(idxBhadMothers[0]);
+          rowMcMatchGen(flag, origin, bHadMother.pdgCode());
+        } else {
+          rowMcMatchGen(flag, origin, 0);
+        }
+      } // close loop over generated particles
+
+
+    } // end for loop
+
+    
+  } // end run function MC Xic0 
+    
+  
+
+  ////////////////////////  Xicp MC process
+  /////////////////////////  
+  //=============================== no centrality
+  void processMc(aod::TracksWMc const& tracks,
+                 aod::McParticles const& mcParticles,
+                 aod::McCollisions const& mcCollisions,
+                 McCollisionsNoCents const& mcCollisionsNoCents,
+                 BCsInfo const& bcs)
+  {
+    runMcMatching<o2::hf_centrality::CentralityEstimator::None>(tracks, mcParticles, mcCollisions, mcCollisionsNoCents, bcs);
+  } // end process Mc
+  PROCESS_SWITCH(HfCandidateCreatorXic0XicpToHadronicExpressions, processMc, "Perform Xicp MC matching with no centrality selection.", true);
+
+  //=============================== FT0C centrality
+  void processMcCentFT0C(aod::TracksWMc const& tracks,
+                         aod::McParticles const& mcParticles,
+                         aod::McCollisions const& mcCollisions,
+                         McCollisionsFT0Cs const& mcCollisionsFT0Cs,
+                         BCsInfo const& bcs)
+  {
+    runMcMatching<o2::hf_centrality::CentralityEstimator::FT0C>(tracks, mcParticles, mcCollisions, mcCollisionsFT0Cs, bcs);
+  }
+  PROCESS_SWITCH(HfCandidateCreatorXic0XicpToHadronicExpressions, processMcCentFT0C, "Perform Xicp MC matching with centrality selection on FT0C.", false);
+
+  //=============================== FT0M centrality
+  void processMcCentFT0M(aod::TracksWMc const& tracks,
+                         aod::McParticles const& mcParticles,
+                         McCollisionsCentFT0Ms const& mcCollisionsCentFT0Ms,
+                         McCollisionsFT0Ms const& mcCollisionsFT0Ms,
+                         BCsInfo const& bcs)
+  {
+    runMcMatching<o2::hf_centrality::CentralityEstimator::FT0M>(tracks, mcParticles, mcCollisionsCentFT0Ms, mcCollisionsFT0Ms, bcs);
+  }
+  PROCESS_SWITCH(HfCandidateCreatorXic0XicpToHadronicExpressions, processMcCentFT0M, "Perform Xicp MC matching with centrality selection on FT0M.", false);
+
+
+  ////////////////////////  Xic0 MC process
+  /////////////////////////  
+  //=============================== no centrality
+  void processMc_Xic0(aod::TracksWMc const& tracks,
+                 aod::McParticles const& mcParticles,
+                 aod::McCollisions const& mcCollisions,
+                 McCollisionsNoCents const& mcCollisionsNoCents,
+                 BCsInfo const& bcs)
+  {
+    runMcMatchingXic0<o2::hf_centrality::CentralityEstimator::None>(tracks, mcParticles, mcCollisions, mcCollisionsNoCents, bcs);
+  } // end process Mc
+  PROCESS_SWITCH(HfCandidateCreatorXic0XicpToHadronicExpressions, processMc_Xic0, "Perform Xic0 MC matching with no centrality selection.", true);
+
+  //=============================== FT0C centrality
+  void processMcCentFT0C_Xic0(aod::TracksWMc const& tracks,
+                         aod::McParticles const& mcParticles,
+                         aod::McCollisions const& mcCollisions,
+                         McCollisionsFT0Cs const& mcCollisionsFT0Cs,
+                         BCsInfo const& bcs)
+  {
+    runMcMatchingXic0<o2::hf_centrality::CentralityEstimator::FT0C>(tracks, mcParticles, mcCollisions, mcCollisionsFT0Cs, bcs);
+  }
+  PROCESS_SWITCH(HfCandidateCreatorXic0XicpToHadronicExpressions, processMcCentFT0C_Xic0, "Perform Xic0 MC matching with centrality selection on FT0C.", false);
+
+  //=============================== FT0M centrality
+  void processMcCentFT0M_Xic0(aod::TracksWMc const& tracks,
+                         aod::McParticles const& mcParticles,
+                         McCollisionsCentFT0Ms const& mcCollisionsCentFT0Ms,
+                         McCollisionsFT0Ms const& mcCollisionsFT0Ms,
+                         BCsInfo const& bcs)
+  {
+    runMcMatchingXic0<o2::hf_centrality::CentralityEstimator::FT0M>(tracks, mcParticles, mcCollisionsCentFT0Ms, mcCollisionsFT0Ms, bcs);
+  }
+  PROCESS_SWITCH(HfCandidateCreatorXic0XicpToHadronicExpressions, processMcCentFT0M_Xic0, "Perform Xic0 MC matching with centrality selection on FT0M.", false);
+
+
+  
+}; // end Xic0 and Xicp MC struct function
+
+
+
+
+
+//=============================== end of candidate creator code
+WorkflowSpec defineDataProcessing(ConfigContext const& cfgc)
+{
+  return WorkflowSpec
+    {
+      adaptAnalysisTask<HfCandidateCreatorXic0XicpToHadronic>(cfgc),
+	adaptAnalysisTask<HfCandidateCreatorXic0XicpToHadronicExpressions>(cfgc)
+	};
+}
+
+
+
